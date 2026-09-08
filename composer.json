@@ -1,0 +1,70 @@
+{
+    "name": "phpdot/scheduler",
+    "description": "Distributed cron-style scheduler: an atomic store claim with lease heartbeats and fencing guarantees exactly one server runs each task, with first-class run history.",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Omar Hamdan",
+            "email": "omar@phpdot.com"
+        }
+    ],
+    "keywords": [
+        "scheduler",
+        "cron",
+        "distributed",
+        "tasks",
+        "jobs",
+        "lease",
+        "phpdot"
+    ],
+    "require": {
+        "php": ">=8.5",
+        "dragonmantank/cron-expression": "^3.0",
+        "ext-mbstring": "*",
+        "phpdot/console": "^0.3",
+        "phpdot/database": "^0.3",
+        "psr/clock": "^1.0",
+        "symfony/console": "^8.0",
+        "symfony/process": "^8.0"
+    },
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "^3.94",
+        "phpdot/container": "^0.3",
+        "phpstan/phpstan": "^2.0",
+        "phpstan/phpstan-strict-rules": "^2.0",
+        "phpunit/phpunit": "^13.0"
+    },
+    "suggest": {
+        "phpdot/container": "Autowires the container-attribute services and #[Config] DTOs declared in src (the attributes stay inert until reflected, so standalone consumers don't need it installed).",
+        "ext-pcntl": "Required by scheduler:work for graceful SIGTERM/SIGINT handling of running tasks."
+    },
+    "autoload": {
+        "psr-4": {
+            "PHPdot\\Scheduler\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "PHPdot\\Scheduler\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse --memory-limit=256M",
+        "cs-fix": "php-cs-fixer fix",
+        "cs-check": "php-cs-fixer fix --dry-run --diff",
+        "check": [
+            "@test",
+            "@analyse",
+            "@cs-check"
+        ]
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "support": {
+        "source": "https://github.com/phpdot/scheduler",
+        "issues": "https://github.com/phpdot/monorepo/issues"
+    }
+}
