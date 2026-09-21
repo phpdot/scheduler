@@ -101,8 +101,8 @@ runtime, never by a deploy.
 | PHP | `>= 8.5` |
 | `ext-mbstring` | `*` |
 | `dragonmantank/cron-expression` | `^3.0` |
-| `phpdot/console` | `^0.4` |
-| `phpdot/database` | `^0.4` |
+| `phpdot/console` | `^0.5` |
+| `phpdot/database` | `^0.5` |
 | `psr/clock` | `^1.0` |
 | `symfony/console` | `^8.0` |
 | `symfony/process` | `^8.0` |
