@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace PHPdot\Scheduler\Tests\Integration\Console;
 
+use PHPdot\Scheduler\Run\RunOutcome;
 use PHPdot\Scheduler\Run\RunState;
+use PHPdot\Scheduler\Store\SchedulerSchema;
 use PHPUnit\Framework\Attributes\Test;
 
 final class CommandsTest extends CommandTestCase
@@ -198,7 +200,20 @@ final class CommandsTest extends CommandTestCase
 
         self::assertSame(0, $exit);
         self::assertStringContainsString('1 died fire closed as expired', $output);
-        self::assertStringContainsString('1 terminal run deleted', $output);
+
+        $finished = $this->store->claim($definition, '2026-09-05T13:00:00+00:00', 'test-host:999', 'test-host', 60, 5);
+
+        self::assertNotNull($finished);
+        self::assertTrue($this->store->finish($finished, new RunOutcome(RunState::Succeeded, 0, 5, 'done', null)));
+        $this->connection->affectingStatement(
+            'UPDATE scheduler_runs SET finished_at = ? WHERE schedule_id = ?',
+            [gmdate('Y-m-d H:i:s', time() - 172800) . '.000000', $definition->id],
+        );
+
+        [$exit, $output] = $this->runCommand('scheduler:prune --stale-grace=300 --days=0');
+
+        self::assertSame(0, $exit);
+        self::assertStringContainsString('2 terminal runs deleted', $output);
         self::assertCount(0, $this->store->runs('demo', 10));
     }
 
@@ -386,6 +401,34 @@ final class CommandsTest extends CommandTestCase
 
         self::assertSame(1, $exit);
         self::assertStringContainsString('failed/expired in window: 1', $output);
+    }
+
+    #[Test]
+    public function installUpgradesAnOlderStoreAndRefusesANewerOne(): void
+    {
+        $this->runCommand('scheduler:install');
+        $this->connection->affectingStatement(
+            "UPDATE scheduler_meta SET meta_value = '2' WHERE meta_key = 'schema_version'",
+        );
+
+        [$exit] = $this->runCommand('scheduler:install');
+
+        self::assertSame(0, $exit);
+
+        $version = $this->connection->selectOne(
+            "SELECT meta_value FROM scheduler_meta WHERE meta_key = 'schema_version'",
+        );
+
+        self::assertSame((string) SchedulerSchema::VERSION, $version === null ? '' : (string) $version['meta_value']);
+
+        $this->connection->affectingStatement(
+            "UPDATE scheduler_meta SET meta_value = '99' WHERE meta_key = 'schema_version'",
+        );
+
+        [$exit, $output] = $this->runCommand('scheduler:install');
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('schema', $output);
     }
 
     #[Test]

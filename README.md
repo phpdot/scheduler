@@ -3,15 +3,20 @@
 Distributed cron-style scheduler for the PHPdot ecosystem. Identical servers all
 tick; an atomic claim in the shared store guarantees exactly one of them runs
 each task. Long tasks hold a lease they keep renewing; when a runner dies, its
-fire is adopted by another server while the fire's window holds (attempt +1) or
-skipped once the window passes and the next fire runs normally — never a
-duplicate, never a catch-up flood — and a fencing token keeps a zombie's writes
-out of the record. Every fire is history you can query.
+fire is adopted by another server (attempt +1) — within the fire's window, or
+any time its lease expires — never a catch-up flood. A fencing token keeps a
+zombie's writes out of the record, a heartbeat the store refuses stops the
+zombie's execution outright, and every adoption keeps the abandoned attempt's
+evidence in the run's attempts log. Every fire is history you can query.
+
+Delivery is **at-least-once**: a run whose final write fails or whose lease was
+lost may execute again. Write commands idempotently — most update-style
+operations already are.
 
 Plain PHP end to end — no Swoole, no per-task cron entries. Storage-agnostic by
 contract (`SchedulerStoreInterface`), relational first via phpdot/database
 (MySQL, PostgreSQL, SQLite). Commands execute through symfony/process under a
-mandatory timeout.
+mandatory timeout that kills the whole process tree, not only the shell.
 
 ## How it works
 
@@ -24,8 +29,11 @@ mandatory timeout.
 3. Exactly one server's claim wins. The winner executes the task and renews its
    lease (heartbeat) while it runs; everyone else records nothing and exits.
 4. If the winner dies, its lease expires and the next eligible tick **adopts**
-   the run (attempt +1). A paused process that comes back later is **fenced**:
-   its writes carry a stale token and touch nothing.
+   the run (attempt +1), whatever fire it held — a worker that died past its
+   fire's grace window is taken over too, never silently skipped. A paused
+   process that comes back later is **fenced**: its writes carry a stale token
+   and touch nothing, and the heartbeat it is refused stops its command — two
+   servers never run the same job side by side.
 5. Every fire leaves a run record: state, holder, duration, exit code, output
    tail — the observability layer, not an afterthought.
 
@@ -43,7 +51,7 @@ skew cannot break a lease.
 | `scheduler:tick` | One pass — what cron calls every minute on every server |
 | `scheduler:work` | The same pass as a daemon (`--interval`, signals handled, live tasks stopped on exit) |
 | `scheduler:runs` | Run history, newest first (`--schedule`, `--limit`) |
-| `scheduler:monitor` | Health check for pagers: exit 1 on missed schedules or recent failures |
+| `scheduler:monitor` | Health check for pagers: exit 1 on missed schedules, stuck runs, or recent failures (deploys' interrupted runs are not failures) |
 | `scheduler:trigger` | Fire one schedule now, claim-guarded |
 | `scheduler:pause` / `scheduler:resume` | Toggle without deleting |
 | `scheduler:remove` | Delete a definition; run history is kept |
@@ -73,6 +81,14 @@ in it).
 - **DST**: a cron in a DST-shifting zone double-runs or skips on transition
   days (intervals are immune). Prefer UTC or intervals unless the business
   genuinely means local time.
+
+## Trust boundary
+
+The schedules table **is** shell: every `command` string runs through the
+worker, and scheduled commands inherit the worker's environment. Write access
+to the store is therefore code execution on every server that ticks — treat it
+with the same care as deploy credentials. `scheduler:define` is the only
+intended write path.
 
 Developers mark what *can* be scheduled; the interface decides *when* — nothing
 about timing is hardcoded:

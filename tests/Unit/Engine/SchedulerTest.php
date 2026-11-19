@@ -4,13 +4,16 @@ declare(strict_types=1);
 
 namespace PHPdot\Scheduler\Tests\Unit\Engine;
 
+use Closure;
 use DateTimeImmutable;
 use PHPdot\Scheduler\Config\SchedulerConfig;
+use PHPdot\Scheduler\Contract\TaskRunnerInterface;
 use PHPdot\Scheduler\Engine\Scheduler;
 use PHPdot\Scheduler\Engine\TickResult;
 use PHPdot\Scheduler\Run\RunState;
 use PHPdot\Scheduler\Runner\RunnerOutcome;
 use PHPdot\Scheduler\Runner\RunnerResult;
+use PHPdot\Scheduler\Runner\TaskSpec;
 use PHPdot\Scheduler\Schedule\Pattern;
 use PHPdot\Scheduler\Schedule\ScheduleDefinition;
 use PHPdot\Scheduler\Tests\Support\FakeRunner;
@@ -195,6 +198,104 @@ final class SchedulerTest extends TestCase
 
         self::assertSame(TickResult::Succeeded, $report->outcomes[0]->result);
         self::assertSame(1, $store->heartbeats);
+    }
+
+    #[Test]
+    public function aRefusedHeartbeatStopsTheExecutionAndReportsFenced(): void
+    {
+        $store = new FakeStore();
+        $store->saveDefinition(new ScheduleDefinition(
+            id: 'every-minute',
+            command: 'dot reports:generate',
+            pattern: Pattern::every('60s'),
+        ));
+        $store->heartbeatsRefused = true;
+        $runner = new FakeRunner();
+        $engine = new Scheduler($store, $runner, new SchedulerConfig());
+
+        $report = $engine->tick(new DateTimeImmutable('2026-09-05T12:34:10+00:00'));
+
+        self::assertSame(TickResult::Interrupted, $report->outcomes[0]->result);
+        self::assertStringContainsString('Lease lost', (string) $report->outcomes[0]->detail);
+        self::assertSame(RunState::Failed, $store->runs['every-minute|2026-09-05T12:34:00+00:00']->state);
+    }
+
+    #[Test]
+    public function aHeartbeatOutagePastTheLeaseStopsTheExecution(): void
+    {
+        $store = new FakeStore();
+        $store->saveDefinition(new ScheduleDefinition(
+            id: 'every-minute',
+            command: 'dot reports:generate',
+            pattern: Pattern::every('60s'),
+        ));
+        $store->heartbeatsThrow = true;
+        $runner = new class implements TaskRunnerInterface {
+            public function run(TaskSpec $task, Closure|null $onPoll = null): RunnerResult
+            {
+                for ($poll = 0; $poll < 5; $poll++) {
+                    if ($onPoll !== null && ($onPoll)() === false) {
+                        return new RunnerResult(RunnerOutcome::Interrupted, null, 0, '', 'stopped by the engine');
+                    }
+
+                    if ($poll < 4) {
+                        sleep(1);
+                    }
+                }
+
+                return new RunnerResult(RunnerOutcome::Completed, 0, 5, 'done', null);
+            }
+
+            public function stopAll(): void {}
+        };
+        $engine = new Scheduler($store, $runner, new SchedulerConfig(leaseTtlSeconds: 3, heartbeatSeconds: 1));
+
+        $report = $engine->tick(new DateTimeImmutable('2026-09-05T12:34:10+00:00'));
+
+        self::assertSame(TickResult::Interrupted, $report->outcomes[0]->result);
+        self::assertStringContainsString('Lease lost', (string) $report->outcomes[0]->detail);
+    }
+
+    #[Test]
+    public function aFailedFinishWriteNeverResurrectsARun(): void
+    {
+        $store = new FakeStore();
+        $store->saveDefinition(new ScheduleDefinition(
+            id: 'every-minute',
+            command: 'dot reports:generate',
+            pattern: Pattern::every('60s'),
+        ));
+        $store->finishThrows = true;
+        $engine = new Scheduler($store, new FakeRunner(), new SchedulerConfig());
+
+        $report = $engine->tick(new DateTimeImmutable('2026-09-05T12:34:10+00:00'));
+
+        self::assertSame(TickResult::Fenced, $report->outcomes[0]->result);
+        self::assertSame(RunState::Running, $store->runs['every-minute|2026-09-05T12:34:00+00:00']->state);
+    }
+
+    #[Test]
+    public function abortStopsStartingRemainingSchedules(): void
+    {
+        $store = new FakeStore();
+        $store->saveDefinition(new ScheduleDefinition(
+            id: 'first',
+            command: 'dot one',
+            pattern: Pattern::every('60s'),
+        ));
+        $store->saveDefinition(new ScheduleDefinition(
+            id: 'second',
+            command: 'dot two',
+            pattern: Pattern::every('60s'),
+        ));
+        $runner = new FakeRunner();
+        $engine = new Scheduler($store, $runner, new SchedulerConfig());
+        $engine->abort();
+
+        $report = $engine->tick(new DateTimeImmutable('2026-09-05T12:34:10+00:00'));
+
+        self::assertSame([], $runner->tasks);
+        self::assertSame([], $report->outcomes);
     }
 
     #[Test]

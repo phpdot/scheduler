@@ -62,12 +62,84 @@ final class ProcessRunnerTest extends TestCase
     public function stopAllInterruptsARunningCommand(): void
     {
         $runner = new ProcessRunner();
-        $result = $runner->run(new TaskSpec('sleep 30', 30, null, null), static function () use ($runner): void {
+        $result = $runner->run(new TaskSpec('sleep 30', 30, null, null), static function () use ($runner): bool {
             $runner->stopAll();
+
+            return false;
         });
 
         self::assertSame(RunnerOutcome::Interrupted, $result->outcome);
         self::assertSame('Stopped for host shutdown.', $result->error);
+        self::assertLessThan(10000, $result->durationMs);
+    }
+
+    #[Test]
+    public function aTimeoutKillsTheCommandsWithinTheWholeTree(): void
+    {
+        if (!function_exists('posix_kill')) {
+            self::markTestSkipped('ext-posix absent; the tree kill cannot be asserted');
+        }
+
+        $marker = sys_get_temp_dir() . '/scheduler-tree-' . uniqid();
+        $result = (new ProcessRunner())->run(new TaskSpec(
+            sprintf('sleep 30 & echo $! > %s; wait', escapeshellarg($marker)),
+            1,
+            null,
+            null,
+        ));
+
+        self::assertSame(RunnerOutcome::TimedOut, $result->outcome);
+        usleep(300000);
+
+        $child = (int) trim((string) file_get_contents($marker));
+        @unlink($marker);
+
+        self::assertGreaterThan(0, $child);
+        self::assertFalse(posix_kill($child, 0), 'the spawned child outlived the timeout');
+    }
+
+    #[Test]
+    public function nonUtf8OutputIsScrubbedBeforeTheFinalWrite(): void
+    {
+        $result = (new ProcessRunner())->run(new TaskSpec(
+            "printf '\xff\xfe broken bytes' && echo ' tail-marker'",
+            10,
+            null,
+            null,
+        ));
+
+        self::assertSame(RunnerOutcome::Completed, $result->outcome);
+        self::assertStringContainsString('tail-marker', $result->outputTail);
+        self::assertTrue(mb_check_encoding($result->outputTail, 'UTF-8'));
+    }
+
+    #[Test]
+    public function aMultibyteCharacterSplitByTheTailWindowIsRepaired(): void
+    {
+        $result = (new ProcessRunner())->run(new TaskSpec(
+            "printf 'a%.0s' {1..8190} && printf '\xf0\x9f\x93\x85' && echo end-marker",
+            10,
+            null,
+            null,
+        ));
+
+        self::assertSame(RunnerOutcome::Completed, $result->outcome);
+        self::assertStringContainsString('end-marker', $result->outputTail);
+        self::assertTrue(mb_check_encoding($result->outputTail, 'UTF-8'));
+    }
+
+    #[Test]
+    public function aPollAnsweringFalseStopsTheCommandForTheEngine(): void
+    {
+        $result = (new ProcessRunner())->run(new TaskSpec(
+            'sleep 30',
+            30,
+            null,
+            null,
+        ), static fn(): bool => false);
+
+        self::assertSame(RunnerOutcome::Interrupted, $result->outcome);
+        self::assertStringContainsString('adopted elsewhere', (string) $result->error);
         self::assertLessThan(10000, $result->durationMs);
     }
 

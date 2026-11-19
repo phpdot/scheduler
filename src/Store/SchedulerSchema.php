@@ -18,7 +18,7 @@ use PHPdot\Scheduler\Exception\SchemaMismatchException;
 
 final class SchedulerSchema
 {
-    public const int VERSION = 2;
+    public const int VERSION = 3;
 
     public const string SCHEDULES_TABLE = 'scheduler_schedules';
 
@@ -68,6 +68,7 @@ final class SchedulerSchema
                 $table->string('tick', 32);
                 $table->string('state', 16)->default('running');
                 $table->integer('attempt')->default(1);
+                $table->text('attempts')->nullable();
                 $table->string('claimed_by', 128);
                 $table->string('server_host', 128);
                 $table->string('started_at', 32);
@@ -101,6 +102,16 @@ final class SchedulerSchema
         }
 
         $version = $this->version();
+
+        if ($version !== null && $version > self::VERSION) {
+            throw SchemaMismatchException::found($version, self::VERSION);
+        }
+
+        if ($version !== null && $version < self::VERSION && !$this->connection->schema()->hasColumn(self::RUNS_TABLE, 'attempts')) {
+            $this->connection->statement(
+                sprintf('ALTER TABLE %s ADD COLUMN attempts TEXT NULL', self::RUNS_TABLE),
+            );
+        }
 
         if ($version === null) {
             $this->connection->affectingStatement(

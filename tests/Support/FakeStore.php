@@ -36,6 +36,10 @@ final class FakeStore implements SchedulerStoreInterface
 
     public bool $heartbeatsThrow = false;
 
+    public bool $heartbeatsRefused = false;
+
+    public bool $finishThrows = false;
+
     public function enabledDefinitions(): array
     {
         return array_values(array_filter($this->definitions, static fn(ScheduleDefinition $definition): bool => $definition->enabled));
@@ -154,11 +158,15 @@ final class FakeStore implements SchedulerStoreInterface
             throw new RuntimeException('store unreachable');
         }
 
-        return true;
+        return !$this->heartbeatsRefused;
     }
 
     public function finish(RunRecord $run, RunOutcome $outcome): bool
     {
+        if ($this->finishThrows) {
+            throw new RuntimeException('final write failed');
+        }
+
         if ($this->refuseFinish) {
             return false;
         }
@@ -211,6 +219,36 @@ final class FakeStore implements SchedulerStoreInterface
         return 0;
     }
 
+    public function runByTick(string $scheduleId, string $tick): RunRecord|null
+    {
+        foreach ($this->runs as $run) {
+            if ($run->scheduleId === $scheduleId && $run->tick === $tick) {
+                return $run;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @return RunRecord|null
+     */
+    public function latestRun(string $scheduleId): RunRecord|null
+    {
+        $latest = null;
+
+        foreach ($this->runs as $run) {
+            if ($run->scheduleId === $scheduleId && ($latest === null || $run->id > $latest->id)) {
+                $latest = $run;
+            }
+        }
+
+        return $latest;
+    }
+
+    /**
+     * @return RunRecord|null
+     */
     public function run(int $id): RunRecord|null
     {
         foreach ($this->runs as $run) {

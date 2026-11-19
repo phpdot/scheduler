@@ -130,6 +130,38 @@ final readonly class Pattern
     }
 
     /**
+     * The UTC instant of the most recent fire at or before $now, grace
+     * ignored: what freshness is judged against, so a weekday schedule is
+     * not expected to have run while it was never due.
+     *
+     * @param DateTimeImmutable $now Evaluated against this instant
+     * @param DateTimeZone $timezone The zone cron fields are interpreted in
+     *
+     * @throws InvalidPatternException When a cron expression can never match.
+     *
+     * @return string The previous fire's tick identifier.
+     */
+    public function previousDueTick(DateTimeImmutable $now, DateTimeZone $timezone): string
+    {
+        if ($this->kind === PatternKind::Interval) {
+            $bucket = intdiv($now->getTimestamp(), $this->intervalSeconds) * $this->intervalSeconds;
+
+            return (new DateTimeImmutable('@' . $bucket))->format(self::TICK_FORMAT);
+        }
+
+        try {
+            $candidate = (new CronExpression($this->expression))
+                ->getPreviousRunDate($now->setTimezone($timezone), 0, false);
+        } catch (Exception $e) {
+            throw InvalidPatternException::forExpression($this->expression, $e->getMessage());
+        }
+
+        return DateTimeImmutable::createFromInterface($candidate)
+            ->setTimezone(new DateTimeZone('UTC'))
+            ->format(self::TICK_FORMAT);
+    }
+
+    /**
      * The next tick after $now this pattern fires on, for display.
      *
      * @param DateTimeImmutable $now Searched forward from this instant

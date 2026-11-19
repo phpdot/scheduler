@@ -107,4 +107,21 @@ final readonly class Dialect
 
         return sprintf('SELECT id FROM %s WHERE id = ?%s', $table, $suffix);
     }
+
+    /**
+     * The statement that pins the claim transaction to READ COMMITTED, or
+     * null where it is meaningless: the overlap guard's plain SELECT must
+     * see the current committed state, which a REPEATABLE READ snapshot
+     * taken before the rival's commit hides.
+     *
+     * @return string|null The isolation statement, null for SQLite.
+     */
+    public function pinReadCommitted(): string|null
+    {
+        return match ($this->driverName) {
+            'mysql' => 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED',
+            'pgsql' => 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED',
+            default => null,
+        };
+    }
 }

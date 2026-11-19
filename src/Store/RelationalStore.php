@@ -24,6 +24,7 @@ use PHPdot\Scheduler\Schedule\CatalogEntry;
 use PHPdot\Scheduler\Schedule\OverlapPolicy;
 use PHPdot\Scheduler\Schedule\Pattern;
 use PHPdot\Scheduler\Schedule\ScheduleDefinition;
+use Throwable;
 
 final class RelationalStore implements SchedulerStoreInterface
 {
@@ -58,7 +59,7 @@ final class RelationalStore implements SchedulerStoreInterface
             sprintf('SELECT %s FROM %s WHERE enabled = TRUE ORDER BY id', self::DEFINITION_COLUMNS, SchedulerSchema::SCHEDULES_TABLE),
         );
 
-        return array_map($this->hydrateDefinition(...), $rows->all());
+        return $this->hydrateAll($rows->all());
     }
 
     /**
@@ -72,7 +73,7 @@ final class RelationalStore implements SchedulerStoreInterface
             sprintf('SELECT %s FROM %s ORDER BY id', self::DEFINITION_COLUMNS, SchedulerSchema::SCHEDULES_TABLE),
         );
 
-        return array_map($this->hydrateDefinition(...), $rows->all());
+        return $this->hydrateAll($rows->all());
     }
 
     /**
@@ -247,6 +248,12 @@ final class RelationalStore implements SchedulerStoreInterface
         $now = $this->dialect->now();
         $nowPlus = $this->dialect->nowPlus($leaseTtlSeconds);
 
+        $pin = $this->dialect->pinReadCommitted();
+
+        if ($pin !== null) {
+            $this->connection->statement($pin);
+        }
+
         /**
          * @var RunRecord|null $claimed
          */
@@ -271,9 +278,10 @@ final class RelationalStore implements SchedulerStoreInterface
                 return null;
             }
 
+            $abandoned = $this->fetchByTick($conn, $definition->id, $tick);
             $adopted = $conn->affectingStatement(
                 sprintf(
-                    "UPDATE %s SET state = '%s', attempt = attempt + 1, claimed_by = ?, server_host = ?, started_at = %s, heartbeat_at = %s, lease_expires_at = %s, finished_at = NULL, exit_code = NULL, duration_ms = NULL, output_tail = NULL, error = NULL WHERE schedule_id = ? AND tick = ? AND state = '%s' AND lease_expires_at <= %s",
+                    "UPDATE %s SET state = '%s', attempt = attempt + 1, claimed_by = ?, server_host = ?, started_at = %s, heartbeat_at = %s, lease_expires_at = %s, attempts = ?, finished_at = NULL, exit_code = NULL, duration_ms = NULL, output_tail = NULL, error = NULL WHERE schedule_id = ? AND tick = ? AND state = '%s' AND lease_expires_at <= %s",
                     SchedulerSchema::RUNS_TABLE,
                     self::STATE_RUNNING,
                     $now,
@@ -282,11 +290,17 @@ final class RelationalStore implements SchedulerStoreInterface
                     self::STATE_RUNNING,
                     $now,
                 ),
-                [$serverId, $serverHost, $definition->id, $tick],
+                [$serverId, $serverHost, $this->attemptsWith($abandoned), $definition->id, $tick],
             );
 
             if ($adopted === 1) {
                 return $this->fetchByTick($conn, $definition->id, $tick);
+            }
+
+            $stale = $this->adoptStaleRun($conn, $definition, $serverId, $serverHost, $now, $nowPlus);
+
+            if ($stale !== null) {
+                return $stale;
             }
 
             $conn->affectingStatement(
@@ -312,6 +326,129 @@ final class RelationalStore implements SchedulerStoreInterface
         }, 3);
 
         return $claimed;
+    }
+
+    /**
+     * Take over the newest expired running row for this schedule, whatever its
+     * tick: a worker that died past the fire's grace window is otherwise
+     * never adopted and the fire is silently skipped. The adoption preserves
+     * the abandoned attempt's evidence in the row's attempts log.
+     *
+     * @param DatabaseConnection $conn The claim's transaction
+     * @param ScheduleDefinition $definition The schedule whose stale run is taken over
+     * @param string $serverId The adopting server's identity
+     * @param string $serverHost The adopting host's name
+     * @param string $now The store's now expression
+     * @param string $nowPlus The store's lease-expiry expression
+     *
+     * @return RunRecord|null The adopted run, when one was taken.
+     */
+    private function adoptStaleRun(
+        DatabaseConnection $conn,
+        ScheduleDefinition $definition,
+        string $serverId,
+        string $serverHost,
+        string $now,
+        string $nowPlus,
+    ): RunRecord|null {
+        $stale = $conn->selectOne(
+            sprintf(
+                "SELECT * FROM %s WHERE schedule_id = ? AND state = '%s' AND lease_expires_at <= %s ORDER BY id DESC LIMIT 1",
+                SchedulerSchema::RUNS_TABLE,
+                self::STATE_RUNNING,
+                $now,
+            ),
+            [$definition->id],
+        );
+
+        if ($stale === null) {
+            return null;
+        }
+
+        $abandoned = $this->hydrateRun($stale);
+        $adopted = $conn->affectingStatement(
+            sprintf(
+                "UPDATE %s SET state = '%s', attempt = attempt + 1, claimed_by = ?, server_host = ?, started_at = %s, heartbeat_at = %s, lease_expires_at = %s, attempts = ?, finished_at = NULL, exit_code = NULL, duration_ms = NULL, output_tail = NULL, error = 'Abandoned: its lease expired before it finished.' WHERE id = ? AND attempt = ? AND state = '%s'",
+                SchedulerSchema::RUNS_TABLE,
+                self::STATE_RUNNING,
+                $now,
+                $now,
+                $nowPlus,
+                self::STATE_RUNNING,
+            ),
+            [
+                $serverId,
+                $serverHost,
+                $this->attemptsWith($abandoned),
+                Columns::int($stale, 'id'),
+                Columns::int($stale, 'attempt'),
+            ],
+        );
+
+        if ($adopted !== 1) {
+            return null;
+        }
+
+        $adoptedRow = $conn->selectOne(
+            sprintf('SELECT * FROM %s WHERE id = ?', SchedulerSchema::RUNS_TABLE),
+            [Columns::int($stale, 'id')],
+        );
+
+        return $adoptedRow === null ? null : $this->hydrateRun($adoptedRow);
+    }
+
+    /**
+     * The attempts log with one abandoned attempt appended: every adoption
+     * keeps the evidence of the attempt it replaces.
+     *
+     * @param RunRecord|null $abandoned The attempt being replaced, null on a first claim
+     *
+     * @return string The JSON attempts log.
+     */
+    private function attemptsWith(RunRecord|null $abandoned): string
+    {
+        if ($abandoned === null) {
+            return '[]';
+        }
+
+        return (string) json_encode([[
+            'attempt' => $abandoned->attempt,
+            'claimed_by' => $abandoned->claimedBy,
+            'started_at' => $abandoned->startedAt,
+            'exit_code' => $abandoned->exitCode,
+            'duration_ms' => $abandoned->durationMs,
+            'error' => $abandoned->error,
+        ]], JSON_UNESCAPED_SLASHES);
+    }
+
+    /**
+     * The run row a schedule's tick identifies, whoever holds it now.
+     *
+     * @param string $scheduleId The schedule the tick belongs to
+     * @param string $tick The fire the row records
+     *
+     * @return RunRecord|null The row, null when the tick never fired.
+     */
+    public function runByTick(string $scheduleId, string $tick): RunRecord|null
+    {
+        $this->ensureSchema();
+
+        return $this->fetchByTick($this->connection, $scheduleId, $tick);
+    }
+
+    /**
+     * @return RunRecord|null
+     */
+    public function latestRun(string $scheduleId): RunRecord|null
+    {
+        $this->ensureSchema();
+
+        $row = $this->connection->selectOne(
+            sprintf('SELECT * FROM %s WHERE schedule_id = ? ORDER BY id DESC LIMIT 1', SchedulerSchema::RUNS_TABLE),
+            [$scheduleId],
+        );
+
+        return $row === null ? null : $this->hydrateRun($row);
     }
 
     /**
@@ -403,13 +540,14 @@ final class RelationalStore implements SchedulerStoreInterface
     public function pruneRuns(int $retentionDays): int
     {
         $this->ensureSchema();
+        $days = max(1, $retentionDays);
 
         return $this->connection->affectingStatement(
             sprintf(
                 "DELETE FROM %s WHERE state <> '%s' AND COALESCE(finished_at, started_at) <= %s",
                 SchedulerSchema::RUNS_TABLE,
                 self::STATE_RUNNING,
-                $this->dialect->nowMinus($retentionDays * 86400),
+                $this->dialect->nowMinus($days * 86400),
             ),
         );
     }
@@ -469,6 +607,31 @@ final class RelationalStore implements SchedulerStoreInterface
     }
 
     /**
+     * Hydrate every schedule that parses: one damaged row is logged and
+     * skipped, never allowed to stop every schedule on the host.
+     *
+     * @param list<array<string, mixed>> $rows scheduler_schedules rows
+     *
+     * @return list<ScheduleDefinition> The rows that parsed.
+     */
+    private function hydrateAll(array $rows): array
+    {
+        $definitions = [];
+
+        foreach ($rows as $row) {
+            $id = Columns::string($row, 'id');
+
+            try {
+                $definitions[] = $this->hydrateDefinition($row);
+            } catch (Throwable $failure) {
+                error_log(sprintf('[scheduler] schedule %s skipped, its row does not parse: %s', $id, $failure->getMessage()));
+            }
+        }
+
+        return $definitions;
+    }
+
+    /**
      * @param array<string, mixed> $row A scheduler_schedules row
      *
      * @return ScheduleDefinition
@@ -514,6 +677,7 @@ final class RelationalStore implements SchedulerStoreInterface
             durationMs: Columns::nullableInt($row, 'duration_ms'),
             outputTail: Columns::nullableString($row, 'output_tail'),
             error: Columns::nullableString($row, 'error'),
+            attempts: Columns::nullableString($row, 'attempts'),
         );
     }
 

@@ -27,14 +27,17 @@ use PHPdot\Scheduler\Run\RunRecord;
 use PHPdot\Scheduler\Run\RunState;
 use PHPdot\Scheduler\Runner\ProcessRunner;
 use PHPdot\Scheduler\Runner\RunnerOutcome;
+use PHPdot\Scheduler\Runner\RunnerResult;
 use PHPdot\Scheduler\Runner\TaskSpec;
 use PHPdot\Scheduler\Schedule\Pattern;
 use PHPdot\Scheduler\Schedule\ScheduleDefinition;
 use Psr\Clock\ClockInterface;
 use Throwable;
 
-final readonly class Scheduler
+final class Scheduler
 {
+    private bool $aborted = false;
+
     /**
      * @param SchedulerStoreInterface $store Where definitions, claims, and history live
      * @param TaskRunnerInterface $runner How claimed tasks execute
@@ -59,6 +62,10 @@ final readonly class Scheduler
         $outcomes = [];
 
         foreach ($this->store->enabledDefinitions() as $definition) {
+            if ($this->aborted) {
+                break;
+            }
+
             $outcomes[] = $this->evaluate($definition, $at);
         }
 
@@ -92,6 +99,7 @@ final readonly class Scheduler
      */
     public function abort(): void
     {
+        $this->aborted = true;
         $this->runner->stopAll();
     }
 
@@ -164,17 +172,22 @@ final readonly class Scheduler
             $this->config->env,
         );
 
-        $lastBeat = 0.0;
-        $result = $this->runner->run($task, function () use ($run, &$lastBeat): void {
-            $lastBeat = $this->renewLease($run, $lastBeat);
+        $lastBeat = microtime(true) - $this->config->heartbeatSeconds;
+        $leaseLost = false;
+        $result = $this->runner->run($task, function () use ($run, &$lastBeat, &$leaseLost): bool {
+            return $this->renewLease($run, $lastBeat, $leaseLost);
         });
+
+        if ($leaseLost) {
+            $result = $this->asAbandoned($result, $lastBeat);
+        }
 
         $state = match ($result->outcome) {
             RunnerOutcome::Completed => RunState::Succeeded,
             RunnerOutcome::Failed, RunnerOutcome::TimedOut, RunnerOutcome::Interrupted => RunState::Failed,
         };
 
-        $recorded = $this->store->finish($run, new RunOutcome(
+        $recorded = $this->finishClaimed($run, new RunOutcome(
             $state,
             $result->exitCode,
             $result->durationMs,
@@ -197,28 +210,114 @@ final readonly class Scheduler
     }
 
     /**
-     * Renew the claim's lease; a store hiccup must never kill healthy work —
-     * the lease TTL and fencing are the safety nets, so failure is swallowed.
+     * Renew the claim's lease, saying whether the run is still ours. A store
+     * hiccup is tolerated until it outlives the lease; a refused fence means
+     * the run was adopted elsewhere and this execution must stop — otherwise
+     * two servers run the same job side by side.
      *
      * @param RunRecord $run The run whose lease is renewed
-     * @param float $lastBeat When the lease was last renewed
+     * @param float $lastBeat When the lease was last renewed successfully
+     * @param bool $leaseLost Set when the claim is known lost
      *
-     * @return float The renewal time, or the previous beat on failure.
+     * @return bool False when the execution must stop.
      */
-    private function renewLease(RunRecord $run, float $lastBeat): float
+    private function renewLease(RunRecord $run, float &$lastBeat, bool &$leaseLost): bool
     {
         $at = microtime(true);
 
         if ($at - $lastBeat < $this->config->heartbeatSeconds) {
-            return $lastBeat;
+            return true;
         }
 
         try {
-            $this->store->heartbeat($run, $this->config->leaseTtlSeconds);
+            $renewed = $this->store->heartbeat($run, $this->config->leaseTtlSeconds);
         } catch (Throwable) {
-            return $lastBeat;
+            if ($this->leaseOutlived($at, $lastBeat)) {
+                $leaseLost = true;
+
+                return false;
+            }
+
+            return true;
         }
 
-        return $at;
+        if (!$renewed) {
+            $leaseLost = true;
+
+            return false;
+        }
+
+        $lastBeat = $at;
+
+        return true;
+    }
+
+    /**
+     * @param float $at Now, wall clock
+     * @param float $lastBeat When the lease was last renewed successfully
+     *
+     * @return bool True when no renewal has succeeded within the lease TTL.
+     */
+    private function leaseOutlived(float $at, float $lastBeat): bool
+    {
+        return $at - $lastBeat > $this->config->leaseTtlSeconds;
+    }
+
+    /**
+     * @param RunnerResult $result The stopped execution's result
+     * @param float $lastBeat When the lease was last renewed successfully
+     *
+     * @return RunnerResult The result retold as an abandoned run.
+     */
+    private function asAbandoned(RunnerResult $result, float $lastBeat): RunnerResult
+    {
+        $age = (int) round(microtime(true) - $lastBeat);
+
+        return new RunnerResult(
+            outcome: RunnerOutcome::Interrupted,
+            exitCode: $result->exitCode,
+            durationMs: $result->durationMs,
+            outputTail: $result->outputTail,
+            error: sprintf('Lease lost for %d seconds: the run was adopted elsewhere or the store was unreachable past the lease.', $age),
+        );
+    }
+
+    /**
+     * Record the outcome, guarding the final write: a failed write must never
+     * leave a finished run claimable again. The row is re-read after a failed
+     * write; a newer attempt already owning it is fenced, anything else is
+     * logged for a human, and the caller hears the run was not recorded —
+     * the store's claim record, not the execution, decides adoption.
+     *
+     * @param RunRecord $run The claim this server held
+     * @param RunOutcome $outcome What the execution did
+     *
+     * @return bool True when this server's outcome was recorded.
+     */
+    private function finishClaimed(RunRecord $run, RunOutcome $outcome): bool
+    {
+        try {
+            return $this->store->finish($run, $outcome);
+        } catch (Throwable $failure) {
+            error_log(sprintf('[scheduler] run %d finish write failed: %s', $run->id, $failure->getMessage()));
+        }
+
+        try {
+            $current = $this->store->runByTick($run->scheduleId, $run->tick);
+
+            if ($current !== null && $current->attempt > $run->attempt) {
+                return false;
+            }
+        } catch (Throwable) {
+        }
+
+        error_log(sprintf(
+            '[scheduler] run %d (schedule %s, tick %s) finished but its outcome could not be recorded; the row may be adopted and re-run.',
+            $run->id,
+            $run->scheduleId,
+            $run->tick,
+        ));
+
+        return false;
     }
 }

@@ -226,6 +226,47 @@ abstract class RelationalStoreTestCase extends TestCase
     }
 
     #[Test]
+    public function aStaleRunPastTheGraceWindowIsAdoptedWithItsEvidenceKept(): void
+    {
+        $definition = $this->storedDefinition();
+        $died = $this->store->claim($definition, '2026-09-05T12:00:00+00:00', 'box-1:100', 'box-1', 60, 5);
+
+        self::assertNotNull($died);
+        $this->connection->affectingStatement(
+            "UPDATE scheduler_runs SET lease_expires_at = '2000-01-01 00:00:00.000000' WHERE id = ?",
+            [$died->id],
+        );
+
+        $adopted = $this->store->claim($definition, '2026-09-05T18:00:00+00:00', 'box-2:200', 'box-2', 60, 5);
+
+        self::assertNotNull($adopted);
+        self::assertSame($died->id, $adopted->id);
+        self::assertSame('2026-09-05T12:00:00+00:00', $adopted->tick);
+        self::assertSame(2, $adopted->attempt);
+        self::assertSame('box-2:200', $adopted->claimedBy);
+
+        $log = json_decode((string) $adopted->attempts, true);
+        self::assertIsArray($log);
+
+        $first = $log[0] ?? null;
+        self::assertIsArray($first);
+        self::assertSame(1, $first['attempt']);
+        self::assertSame('box-1:100', $first['claimed_by']);
+    }
+
+    #[Test]
+    public function aDamagedScheduleRowIsSkippedNotFatal(): void
+    {
+        $this->storedDefinition();
+        $this->connection->affectingStatement(
+            "UPDATE scheduler_schedules SET timezone = 'Mars/Olympus' WHERE id = ?",
+            ['every-minute'],
+        );
+
+        self::assertSame([], $this->store->enabledDefinitions());
+    }
+
+    #[Test]
     public function aClaimAgainstAMissingScheduleRefuses(): void
     {
         $ghost = new ScheduleDefinition(

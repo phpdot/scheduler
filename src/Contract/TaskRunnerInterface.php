@@ -20,7 +20,7 @@ interface TaskRunnerInterface
 {
     /**
      * @param TaskSpec $task What to execute and under which limits
-     * @param Closure|null $onPoll Invoked while the command runs, to renew leases
+     * @param Closure(): bool|null $onPoll Invoked while the command runs; false stops the execution
      *
      * @return RunnerResult How the execution ended.
      */

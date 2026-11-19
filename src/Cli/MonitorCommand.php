@@ -18,6 +18,7 @@ use DateTimeZone;
 use PHPdot\Console\Command;
 use PHPdot\Scheduler\Contract\SchedulerStoreInterface;
 use PHPdot\Scheduler\Exception\SchedulerException;
+use PHPdot\Scheduler\Run\RunRecord;
 use PHPdot\Scheduler\Run\RunState;
 use PHPdot\Scheduler\Schedule\PatternKind;
 use PHPdot\Scheduler\Schedule\ScheduleDefinition;
@@ -67,29 +68,8 @@ final class MonitorCommand extends Command
             ? null
             : $now->modify(sprintf('-%d minutes', max(0, $this->intOption($input, 'failed-within') ?? 1440)));
         $multiplier = max(1, $this->intOption($input, 'missed-multiplier') ?? 2);
-        $runs = $this->store->runs(null, max(1, $this->intOption($input, 'scan') ?? 1000));
 
         $failures = 0;
-        $lastSuccess = [];
-
-        foreach ($runs as $run) {
-            $startedAt = DateTimeImmutable::createFromFormat(self::STORED_FORMAT, $run->startedAt, new DateTimeZone('UTC'));
-
-            if ($startedAt === false) {
-                continue;
-            }
-
-            if ($failureCutoff !== null
-                && $startedAt > $failureCutoff
-                && ($run->state === RunState::Failed || $run->state === RunState::Expired)) {
-                $failures++;
-            }
-
-            if ($run->state === RunState::Succeeded && !isset($lastSuccess[$run->scheduleId])) {
-                $lastSuccess[$run->scheduleId] = $startedAt;
-            }
-        }
-
         $rows = [];
         $breaches = 0;
 
@@ -98,8 +78,24 @@ final class MonitorCommand extends Command
                 continue;
             }
 
+            $latest = $this->store->latestRun($definition->id);
+
+            if ($latest !== null && $latest->state === RunState::Running && $this->leaseExpired($latest)) {
+                $rows[] = ['schedule' => $definition->id, 'period' => 'running', 'last success' => '—', 'status' => 'STUCK'];
+                $breaches++;
+
+                continue;
+            }
+
+            if ($latest !== null && $failureCutoff !== null
+                && $this->startedBefore($latest, $now) > $failureCutoff
+                && ($latest->state === RunState::Failed || $latest->state === RunState::Expired)) {
+                $failures++;
+            }
+
             try {
                 $period = $this->periodSeconds($definition, $now);
+                $previousDue = $definition->pattern->previousDueTick($now, $definition->timezone);
             } catch (SchedulerException) {
                 $rows[] = ['schedule' => $definition->id, 'period' => 'invalid', 'last success' => '—', 'status' => 'pattern never matches'];
                 $breaches++;
@@ -108,17 +104,16 @@ final class MonitorCommand extends Command
             }
 
             $freshness = max(120, $period * $multiplier);
-            $success = $lastSuccess[$definition->id] ?? null;
-            $missed = $success === null || $success < $now->modify(sprintf('-%d seconds', $freshness));
+            $covered = $this->coveredFire($definition, $latest, $previousDue, $now, $freshness);
 
             $rows[] = [
                 'schedule' => $definition->id,
                 'period' => $period . 's',
-                'last success' => $success?->format('Y-m-d H:i:s') ?? 'never',
-                'status' => $missed ? 'MISSED' : 'ok',
+                'last success' => $covered?->format('Y-m-d H:i:s') ?? 'never',
+                'status' => $covered === null ? 'MISSED' : 'ok',
             ];
 
-            if ($missed) {
+            if ($covered === null) {
                 $breaches++;
             }
         }
@@ -130,6 +125,70 @@ final class MonitorCommand extends Command
         $this->comment($output, sprintf('monitor — failed/expired in window: %d, freshness breaches: %d', $failures, $breaches > 0 ? $breaches : 0));
 
         return ($failures > 0 || $breaches > 0) ? self::FAILURE : self::SUCCESS;
+    }
+
+    /**
+     * When the schedule's newest run says a fire was covered: a run claims
+     * the latest due tick or a newer one. Deploy-interrupted runs still
+     * count — the fire ran, only its host went away — and a quiet schedule
+     * is judged against its own fires, never a global scan window.
+     *
+     * @param ScheduleDefinition $definition The schedule being measured
+     * @param ScheduleDefinition $definition The schedule being measured
+     * @param RunRecord|null $latest Its newest run, null when it never ran
+     * @param string $previousDue The latest fire's tick identifier
+     * @param DateTimeImmutable $now The instant the judgement is made at
+     * @param int $freshness How stale a run may be, seconds
+     *
+     * @return DateTimeImmutable|null When the covering run started, null when missed.
+     */
+    private function coveredFire(
+        ScheduleDefinition $definition,
+        RunRecord|null $latest,
+        string $previousDue,
+        DateTimeImmutable $now,
+        int $freshness,
+    ): DateTimeImmutable|null {
+        if ($latest === null) {
+            $age = $now->getTimestamp() - (new DateTimeImmutable($previousDue))->getTimestamp();
+
+            return $age > $definition->graceSeconds ? null : $now;
+        }
+
+        $started = $this->startedBefore($latest, $now);
+
+        if ($latest->tick >= $previousDue) {
+            return $started;
+        }
+
+        $stale = $now->getTimestamp() - $started->getTimestamp();
+
+        return $stale <= $freshness ? $started : null;
+    }
+
+    /**
+     * @param RunRecord $run The run whose lease is examined
+     *
+     * @return bool True when the run's lease has expired while it runs.
+     */
+    private function leaseExpired(RunRecord $run): bool
+    {
+        $expires = DateTimeImmutable::createFromFormat(self::STORED_FORMAT, $run->leaseExpiresAt, new DateTimeZone('UTC'));
+
+        return $expires !== false && $expires < new DateTimeImmutable('now');
+    }
+
+    /**
+     * @param RunRecord $run The run whose start is read
+     * @param DateTimeImmutable $now The instant the read is made at
+     *
+     * @return DateTimeImmutable When the run started, now when unparsable.
+     */
+    private function startedBefore(RunRecord $run, DateTimeImmutable $now): DateTimeImmutable
+    {
+        $started = DateTimeImmutable::createFromFormat(self::STORED_FORMAT, $run->startedAt, new DateTimeZone('UTC'));
+
+        return $started === false ? $now : $started;
     }
 
     /**

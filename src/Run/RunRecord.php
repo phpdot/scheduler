@@ -49,5 +49,6 @@ final readonly class RunRecord
         public int|null $durationMs,
         public string|null $outputTail,
         public string|null $error,
+        public string|null $attempts = null,
     ) {}
 }

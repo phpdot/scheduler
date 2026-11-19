@@ -22,6 +22,13 @@ use PHPdot\Scheduler\Exception\InvalidConfigurationException;
 final class SchedulerConfig
 {
     /**
+     * Per-instance salt in every server identity: containers sharing a
+     * hostname and both holding pid 1 would otherwise collide on identity
+     * and both believe they won a claim.
+     */
+    private readonly string $bootSalt;
+
+    /**
      * @param string $serverHost Identity for concurrency caps; empty derives the hostname
      * @param int $concurrencyLimit Max runs this host holds with live leases
      * @param int $leaseTtlSeconds How long a claim lives without a heartbeat
@@ -41,6 +48,8 @@ final class SchedulerConfig
         public string|null $commandCwd = null,
         public array $env = [],
     ) {
+        $this->bootSalt = bin2hex(random_bytes(4));
+
         if ($concurrencyLimit < 1) {
             throw InvalidConfigurationException::forField('concurrencyLimit', 'it must be at least 1');
         }
@@ -76,10 +85,10 @@ final class SchedulerConfig
     }
 
     /**
-     * @return string The per-process identity recorded on claims.
+     * @return string The per-instance identity recorded on claims.
      */
     public function resolveServerId(): string
     {
-        return $this->resolveHost() . ':' . (string) getmypid();
+        return $this->resolveHost() . ':' . (string) getmypid() . ':' . $this->bootSalt;
     }
 }

@@ -154,6 +154,28 @@ interface SchedulerStoreInterface
     public function run(int $id): RunRecord|null;
 
     /**
+     * The run row a schedule's tick identifies, whoever holds it now — what a
+     * failed finish write re-reads to learn whether a newer attempt owns it.
+     *
+     * @param string $scheduleId The schedule the tick belongs to
+     * @param string $tick The fire the row records
+     *
+     * @return RunRecord|null The row, null when the tick never fired.
+     */
+    public function runByTick(string $scheduleId, string $tick): RunRecord|null;
+
+    /**
+     * The newest run row for a schedule, whatever its state — what freshness
+     * is judged against, per schedule, so a busy neighbourhood cannot make a
+     * quiet schedule look never-run.
+     *
+     * @param string $scheduleId The schedule the run belongs to
+     *
+     * @return RunRecord|null The newest run, null when it never ran.
+     */
+    public function latestRun(string $scheduleId): RunRecord|null;
+
+    /**
      * @param string|null $scheduleId Filter to one schedule, null for all
      * @param int $limit Maximum rows returned
      *
