@@ -109,19 +109,56 @@ final readonly class Dialect
     }
 
     /**
-     * The statement that pins the claim transaction to READ COMMITTED, or
-     * null where it is meaningless: the overlap guard's plain SELECT must
-     * see the current committed state, which a REPEATABLE READ snapshot
-     * taken before the rival's commit hides.
+     * The runs one batch of a retention prune deletes: those that started
+     * before the cutoff, in start order, each batch resuming where the last
+     * stopped. A cursor rather than a repeated LIMIT, because a database
+     * keeps deleted entries in its indexes for a while and would make every
+     * batch walk the ones before it again.
      *
-     * @return string|null The isolation statement, null for SQLite.
+     * @param string $table The runs table
+     * @param int $seconds How far back a run must have started to go
+     * @param int $rows The batch size
+     *
+     * @return string The SELECT with three cursor bindings, in start-then-id order.
+     */
+    public function pruneCandidates(string $table, int $seconds, int $rows): string
+    {
+        return sprintf(
+            "SELECT id, started_at FROM %s WHERE state <> 'running' AND started_at <= %s AND (started_at > ? OR (started_at = ? AND id > ?)) ORDER BY started_at, id LIMIT %d",
+            $table,
+            $this->nowMinus($seconds),
+            $rows,
+        );
+    }
+
+    /**
+     * A lookup answering one row exactly when a named index exists on a table.
+     *
+     * @param string $table The table carrying the index
+     * @param string $index The index name
+     *
+     * @return string The SELECT statement with the table and index bindings.
+     */
+    public function indexLookup(string $table, string $index): string
+    {
+        return match ($this->driverName) {
+            'mysql' => 'SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1',
+            'pgsql' => 'SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND tablename = ? AND indexname = ? LIMIT 1',
+            default => "SELECT 1 FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND name = ? LIMIT 1",
+        };
+    }
+
+    /**
+     * The statement that pins the claim transaction to READ COMMITTED, issued
+     * as its first statement; or null where no pin is needed. PostgreSQL takes
+     * a snapshot before the claim's row lock, which a stricter isolation would
+     * keep the rival's run hidden behind; MySQL takes its read view at the
+     * first plain read, which here already follows the lock.
+     *
+     * @return string|null The isolation statement, null for MySQL and SQLite.
      */
     public function pinReadCommitted(): string|null
     {
-        return match ($this->driverName) {
-            'mysql' => 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED',
-            'pgsql' => 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED',
-            default => null,
-        };
+        return $this->driverName === 'pgsql' ? 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED' : null;
     }
 }

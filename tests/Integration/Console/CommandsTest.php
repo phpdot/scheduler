@@ -6,7 +6,6 @@ namespace PHPdot\Scheduler\Tests\Integration\Console;
 
 use PHPdot\Scheduler\Run\RunOutcome;
 use PHPdot\Scheduler\Run\RunState;
-use PHPdot\Scheduler\Store\SchedulerSchema;
 use PHPUnit\Framework\Attributes\Test;
 
 final class CommandsTest extends CommandTestCase
@@ -206,8 +205,8 @@ final class CommandsTest extends CommandTestCase
         self::assertNotNull($finished);
         self::assertTrue($this->store->finish($finished, new RunOutcome(RunState::Succeeded, 0, 5, 'done', null)));
         $this->connection->affectingStatement(
-            'UPDATE scheduler_runs SET finished_at = ? WHERE schedule_id = ?',
-            [gmdate('Y-m-d H:i:s', time() - 172800) . '.000000', $definition->id],
+            'UPDATE scheduler_runs SET started_at = ?, finished_at = ? WHERE schedule_id = ?',
+            [$this->daysAgo(2), $this->daysAgo(2), $definition->id],
         );
 
         [$exit, $output] = $this->runCommand('scheduler:prune --stale-grace=300 --days=0');
@@ -360,42 +359,83 @@ final class CommandsTest extends CommandTestCase
     }
 
     #[Test]
-    public function monitorFailsOnMissedSchedulesAndRecentFailures(): void
+    public function monitorPassesAnEmptyStoreAndAScheduleThatOwesNothingYet(): void
     {
         [$exit, $output] = $this->runCommand('scheduler:monitor');
 
         self::assertSame(0, $exit, 'an empty store is healthy');
+        self::assertStringNotContainsString('MISSED', $output);
 
-        $this->runCommand(sprintf(
-            'scheduler:define %s %s --cron="0 3 * * *"',
-            'healthy:report',
-            escapeshellarg('echo ok'),
-        ));
+        $this->runCommand(sprintf('scheduler:define %s %s --cron="0 3 * * *"', 'fresh:report', escapeshellarg('echo ok')));
+
+        [$exit, $output] = $this->runCommand('scheduler:monitor');
+
+        self::assertSame(0, $exit, 'a schedule defined before its first fire owes nothing yet');
+        self::assertStringContainsString('fresh:report', $output);
+        self::assertStringContainsString('pending', $output);
+        self::assertStringContainsString('never', $output);
+        self::assertStringNotContainsString('MISSED', $output);
+    }
+
+    #[Test]
+    public function monitorPagesAScheduleThatMissedAFireItOwed(): void
+    {
+        $this->establish('ghost:report', 'echo never', '--cron="0 4 * * *"');
+
+        [$exit, $output] = $this->runCommand('scheduler:monitor');
+
+        self::assertSame(1, $exit);
+        self::assertStringContainsString('ghost:report', $output);
+        self::assertStringContainsString('MISSED', $output);
+    }
+
+    #[Test]
+    public function monitorPassesAScheduleWhoseLatestFireRan(): void
+    {
+        $this->establish('healthy:report', 'echo ok', '--cron="0 3 * * *"');
         $this->runCommand('scheduler:trigger healthy:report');
 
         [$exit, $output] = $this->runCommand('scheduler:monitor');
 
         self::assertSame(0, $exit);
         self::assertStringContainsString('healthy:report', $output);
-        self::assertStringContainsString('ok', $output);
+        self::assertMatchesRegularExpression('/healthy:report[^\n]*\| ok\s+\|/s', $output);
+    }
 
-        $this->runCommand(sprintf(
-            'scheduler:define %s %s --cron="0 4 * * *"',
-            'ghost:report',
-            escapeshellarg('echo never'),
-        ));
+    #[Test]
+    public function monitorAlarmsOnAFailureEvenWhenALaterFireSucceeded(): void
+    {
+        $marker = sys_get_temp_dir() . '/scheduler-flaky-' . uniqid();
 
-        [$exit, $output] = $this->runCommand('scheduler:monitor');
+        $this->establish('flaky:report', sprintf('if [ -e %1$s ]; then echo ok; else touch %1$s; exit 7; fi', escapeshellarg($marker)), '--every=1m');
 
-        self::assertSame(1, $exit);
-        self::assertStringContainsString('MISSED', $output);
+        try {
+            [$failedExit] = $this->runCommand('scheduler:trigger flaky:report');
+            sleep(1);
+            [$recoveredExit] = $this->runCommand('scheduler:trigger flaky:report');
 
-        $this->runCommand(sprintf(
-            'scheduler:define %s %s --cron="0 5 * * *"',
-            'flaky:report',
-            escapeshellarg('exit 7'),
-        ));
-        $this->runCommand('scheduler:trigger flaky:report');
+            self::assertSame(1, $failedExit);
+            self::assertSame(0, $recoveredExit);
+
+            [$exit, $output] = $this->runCommand('scheduler:monitor');
+
+            self::assertSame(1, $exit, 'a failure does not stop counting because the next fire recovered');
+            self::assertStringContainsString('failed/expired in window: 1', $output);
+            self::assertSame(RunState::Succeeded, $this->store->latestRun('flaky:report')?->state);
+
+            [$exit] = $this->runCommand('scheduler:monitor --failed-within=0');
+
+            self::assertSame(0, $exit, 'the failure half is switched off');
+        } finally {
+            @unlink($marker);
+        }
+    }
+
+    #[Test]
+    public function monitorAlarmsOnAFailedRun(): void
+    {
+        $this->establish('broken:report', 'exit 7', '--cron="0 5 * * *"');
+        $this->runCommand('scheduler:trigger broken:report');
 
         [$exit, $output] = $this->runCommand('scheduler:monitor');
 
@@ -404,31 +444,86 @@ final class CommandsTest extends CommandTestCase
     }
 
     #[Test]
-    public function installUpgradesAnOlderStoreAndRefusesANewerOne(): void
+    public function triggerExitsNonZeroWhenTheRunFailedOrWasRefused(): void
     {
-        $this->runCommand('scheduler:install');
-        $this->connection->affectingStatement(
-            "UPDATE scheduler_meta SET meta_value = '2' WHERE meta_key = 'schema_version'",
-        );
+        $this->runCommand(sprintf('scheduler:define %s %s --every=30s', 'flaky', escapeshellarg('exit 7')));
 
-        [$exit] = $this->runCommand('scheduler:install');
+        [$exit, $output] = $this->runCommand('scheduler:trigger flaky');
+
+        self::assertSame(1, $exit, 'a run that failed is not a successful trigger');
+        self::assertStringContainsString('failed', $output);
+
+        $this->runCommand(sprintf('scheduler:define %s %s --every=30s', 'busy', escapeshellarg('sleep 20')));
+        $definition = $this->store->definition('busy');
+
+        self::assertNotNull($definition);
+        self::assertNotNull($this->store->claim($definition, '2026-01-01T00:00:00+00:00', 'someone-else:1:aaaa', 'other-host', 600, 5));
+
+        [$exit, $output] = $this->runCommand('scheduler:trigger busy');
+
+        self::assertSame(1, $exit, 'a fire that was refused never ran');
+        self::assertStringContainsString('overlap_skipped', $output);
+
+        $this->runCommand(sprintf('scheduler:define %s %s --every=30s', 'good', escapeshellarg('echo ok')));
+
+        [$exit, $output] = $this->runCommand('scheduler:trigger good');
 
         self::assertSame(0, $exit);
+        self::assertStringContainsString('succeeded', $output);
+    }
 
-        $version = $this->connection->selectOne(
-            "SELECT meta_value FROM scheduler_meta WHERE meta_key = 'schema_version'",
-        );
+    #[Test]
+    public function defineReportsBadInputAsErrorsNotExceptions(): void
+    {
+        $cases = [
+            ['scheduler:define bad "echo x" --cron="nonsense"', 'Invalid schedule pattern "nonsense"'],
+            ['scheduler:define bad "echo x" --preset="nope"', 'Unknown preset "nope"'],
+            ['scheduler:define bad "echo x" --cron="* * * * *" --overlap="sometimes"', 'Invalid schedule definition field "overlap"'],
+            ['scheduler:define bad "echo x" --cron="* * * * *" --timezone="Mars/Olympus"', 'Mars/Olympus'],
+            ['scheduler:define bad "echo x" --cron="* * * * *" --timeout=abc', 'Option "--timeout" needs a whole number, not "abc".'],
+            ['scheduler:define bad "echo x" --cron="* * * * *" --grace=90s', 'Option "--grace" needs a whole number, not "90s".'],
+        ];
 
-        self::assertSame((string) SchedulerSchema::VERSION, $version === null ? '' : (string) $version['meta_value']);
+        foreach ($cases as [$command, $expected]) {
+            [$exit, $output] = $this->runCommand($command);
 
-        $this->connection->affectingStatement(
-            "UPDATE scheduler_meta SET meta_value = '99' WHERE meta_key = 'schema_version'",
-        );
+            self::assertSame(1, $exit, $command);
+            self::assertStringContainsString($expected, $output, $command);
+            self::assertStringNotContainsString('.php line', $output, $command);
+        }
 
-        [$exit, $output] = $this->runCommand('scheduler:install');
+        self::assertNull($this->store->definition('bad'));
+    }
 
-        self::assertSame(1, $exit);
-        self::assertStringContainsString('schema', $output);
+    #[Test]
+    public function numericOptionsRefuseATypoInsteadOfFallingBackToADefault(): void
+    {
+        foreach ([
+            'scheduler:prune --days=abc',
+            'scheduler:prune --stale-grace=1.5',
+            'scheduler:runs --limit=many',
+            'scheduler:monitor --failed-within=later',
+            'scheduler:monitor --missed-multiplier=2x',
+        ] as $command) {
+            [$exit, $output] = $this->runCommand($command);
+
+            self::assertSame(1, $exit, $command);
+            self::assertStringContainsString('needs a whole number', $output, $command);
+        }
+
+        [$exit] = $this->runCommand('scheduler:prune --days=7 --stale-grace=60');
+
+        self::assertSame(0, $exit);
+    }
+
+    #[Test]
+    public function pruneReportsTheRetentionItApplies(): void
+    {
+        [$exit, $output] = $this->runCommand('scheduler:prune --days=0');
+
+        self::assertSame(0, $exit);
+        self::assertStringContainsString('1-day retention', $output);
+        self::assertStringNotContainsString('0-day', $output);
     }
 
     #[Test]
@@ -440,13 +535,19 @@ final class CommandsTest extends CommandTestCase
 
         self::assertSame(0, $exit);
         self::assertStringContainsString('paused', $output);
-        self::assertFalse($this->store->definition('demo')?->enabled ?? true);
+        $paused = $this->store->definition('demo');
+
+        self::assertNotNull($paused);
+        self::assertFalse($paused->enabled);
 
         [$exit, $output] = $this->runCommand('scheduler:resume demo');
 
         self::assertSame(0, $exit);
         self::assertStringContainsString('resumed', $output);
-        self::assertTrue($this->store->definition('demo')?->enabled ?? false);
+        $resumed = $this->store->definition('demo');
+
+        self::assertNotNull($resumed);
+        self::assertTrue($resumed->enabled);
 
         [$exit, $output] = $this->runCommand('scheduler:remove demo --force');
 
@@ -457,5 +558,32 @@ final class CommandsTest extends CommandTestCase
         [$exit] = $this->runCommand('scheduler:resume demo');
 
         self::assertSame(1, $exit);
+    }
+
+    /**
+     * Defines a schedule and backdates its stamp, so the monitor judges it as
+     * a schedule that has been expected to fire for a day. A definition
+     * stamp is whole seconds; the fraction belongs to run stamps.
+     *
+     * @param string $id The schedule id
+     * @param string $command The command it runs
+     * @param string $timing The timing options passed to scheduler:define
+     *
+     * @return void
+     */
+    private function establish(string $id, string $command, string $timing): void
+    {
+        [$exit] = $this->runCommand(sprintf('scheduler:define %s %s %s', $id, escapeshellarg($command), $timing));
+
+        self::assertSame(0, $exit);
+        $this->connection->affectingStatement('UPDATE scheduler_schedules SET updated_at = ? WHERE id = ?', [gmdate('Y-m-d H:i:s', time() - 86400), $id]);
+    }
+
+    /**
+     * @return string A store-format stamp a day count in the past.
+     */
+    private function daysAgo(int $days): string
+    {
+        return gmdate('Y-m-d H:i:s', time() - $days * 86400) . '.000000';
     }
 }

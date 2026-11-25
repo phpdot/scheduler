@@ -14,6 +14,7 @@ namespace PHPdot\Scheduler\Cli;
 
 use PHPdot\Console\Command;
 use PHPdot\Scheduler\Engine\Scheduler;
+use PHPdot\Scheduler\Engine\TickResult;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
@@ -68,6 +69,6 @@ final class TriggerCommand extends Command
             'detail' => $outcome->detail ?? '',
         ]]);
 
-        return self::SUCCESS;
+        return $outcome->result === TickResult::Succeeded ? self::SUCCESS : self::FAILURE;
     }
 }

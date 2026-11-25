@@ -32,7 +32,7 @@ require $autoload . '/vendor/autoload.php';
 
 $database = $argv[1] ?? '';
 
-if (!is_string($database) || $database === '') {
+if ($database === '') {
     fwrite(STDERR, "usage: php work-fixture.php <database>\n");
     exit(2);
 }

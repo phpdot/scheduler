@@ -15,7 +15,9 @@ namespace PHPdot\Scheduler\Store;
 use DateTimeImmutable;
 use DateTimeZone;
 use PHPdot\Database\DatabaseConnection;
+use PHPdot\Scheduler\Contract\RecentFailuresInterface;
 use PHPdot\Scheduler\Contract\SchedulerStoreInterface;
+use PHPdot\Scheduler\Exception\InvalidConfigurationException;
 use PHPdot\Scheduler\Exception\SchemaMismatchException;
 use PHPdot\Scheduler\Run\RunOutcome;
 use PHPdot\Scheduler\Run\RunRecord;
@@ -26,11 +28,27 @@ use PHPdot\Scheduler\Schedule\Pattern;
 use PHPdot\Scheduler\Schedule\ScheduleDefinition;
 use Throwable;
 
-final class RelationalStore implements SchedulerStoreInterface
+final class RelationalStore implements RecentFailuresInterface, SchedulerStoreInterface
 {
+    public const int DEFAULT_MAX_ATTEMPTS = 3;
+
     private const string STATE_RUNNING = 'running';
 
-    private const string DEFINITION_COLUMNS = 'id, command, pattern, timezone, timeout_seconds, idle_timeout_seconds, overlap, grace_seconds, enabled, description';
+    private const string DEFINITION_COLUMNS = 'id, command, pattern, timezone, timeout_seconds, idle_timeout_seconds, overlap, grace_seconds, enabled, description, created_at, updated_at';
+
+    private const int ATTEMPT_LOG_LIMIT = 20;
+
+    private const int PRUNE_BATCH_ROWS = 5000;
+
+    private const string SPENT_MESSAGE = 'Abandoned %d times without completing; not attempted again.';
+
+    /**
+     * Where a prune pass starts: a start stamp earlier than any stored one,
+     * given twice for the cursor's comparison, then the lowest id.
+     *
+     * @var list<string|int>
+     */
+    private const array PRUNE_OLDEST = ['', '', 0];
 
     private readonly Dialect $dialect;
 
@@ -40,10 +58,18 @@ final class RelationalStore implements SchedulerStoreInterface
 
     /**
      * @param DatabaseConnection $connection The shared store connection
+     * @param int $maxAttempts Times one fire may be handed to a runner before it is recorded failed instead of adopted
+     *
+     * @throws InvalidConfigurationException When the attempt ceiling is below one.
      */
     public function __construct(
         private readonly DatabaseConnection $connection,
+        private readonly int $maxAttempts = self::DEFAULT_MAX_ATTEMPTS,
     ) {
+        if ($maxAttempts < 1) {
+            throw InvalidConfigurationException::forField('maxAttempts', 'it must be at least 1');
+        }
+
         $this->dialect = new Dialect($connection->getDriverName());
         $this->schema = new SchedulerSchema($connection);
     }
@@ -92,11 +118,21 @@ final class RelationalStore implements SchedulerStoreInterface
     }
 
     /**
+     * Store a schedule, or leave the row untouched when it already says
+     * exactly this: a schedule re-applied at every deploy must not look
+     * redefined each time.
+     *
+     * @param ScheduleDefinition $definition The definition to insert or update
+     *
      * @return void
      */
     public function saveDefinition(ScheduleDefinition $definition): void
     {
         $this->ensureSchema();
+
+        if ($this->isStored($definition)) {
+            return;
+        }
 
         $stamp = (new DateTimeImmutable('now'))->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d H:i:s');
 
@@ -247,17 +283,16 @@ final class RelationalStore implements SchedulerStoreInterface
         $this->ensureSchema();
         $now = $this->dialect->now();
         $nowPlus = $this->dialect->nowPlus($leaseTtlSeconds);
-
-        $pin = $this->dialect->pinReadCommitted();
-
-        if ($pin !== null) {
-            $this->connection->statement($pin);
-        }
+        $pin = $this->connection->transactionLevel() === 0 ? $this->dialect->pinReadCommitted() : null;
 
         /**
          * @var RunRecord|null $claimed
          */
-        $claimed = $this->connection->transaction(function (DatabaseConnection $conn) use ($definition, $tick, $serverId, $serverHost, $concurrencyLimit, $now, $nowPlus): RunRecord|null {
+        $claimed = $this->connection->transaction(function (DatabaseConnection $conn) use ($definition, $tick, $serverId, $serverHost, $concurrencyLimit, $now, $nowPlus, $pin): RunRecord|null {
+            if ($pin !== null) {
+                $conn->statement($pin);
+            }
+
             if ($conn->selectOne($this->dialect->lockScheduleRow(SchedulerSchema::SCHEDULES_TABLE), [$definition->id]) === null) {
                 return null;
             }
@@ -281,7 +316,7 @@ final class RelationalStore implements SchedulerStoreInterface
             $abandoned = $this->fetchByTick($conn, $definition->id, $tick);
             $adopted = $conn->affectingStatement(
                 sprintf(
-                    "UPDATE %s SET state = '%s', attempt = attempt + 1, claimed_by = ?, server_host = ?, started_at = %s, heartbeat_at = %s, lease_expires_at = %s, attempts = ?, finished_at = NULL, exit_code = NULL, duration_ms = NULL, output_tail = NULL, error = NULL WHERE schedule_id = ? AND tick = ? AND state = '%s' AND lease_expires_at <= %s",
+                    "UPDATE %s SET state = '%s', attempt = attempt + 1, claimed_by = ?, server_host = ?, started_at = %s, heartbeat_at = %s, lease_expires_at = %s, attempts = ?, finished_at = NULL, exit_code = NULL, duration_ms = NULL, output_tail = NULL, error = NULL WHERE schedule_id = ? AND tick = ? AND state = '%s' AND lease_expires_at <= %s AND attempt < ?",
                     SchedulerSchema::RUNS_TABLE,
                     self::STATE_RUNNING,
                     $now,
@@ -290,12 +325,14 @@ final class RelationalStore implements SchedulerStoreInterface
                     self::STATE_RUNNING,
                     $now,
                 ),
-                [$serverId, $serverHost, $this->attemptsWith($abandoned), $definition->id, $tick],
+                [$serverId, $serverHost, $this->attemptsWith($abandoned), $definition->id, $tick, $this->maxAttempts],
             );
 
             if ($adopted === 1) {
                 return $this->fetchByTick($conn, $definition->id, $tick);
             }
+
+            $this->retireIfSpent($conn, $abandoned, $now);
 
             $stale = $this->adoptStaleRun($conn, $definition, $serverId, $serverHost, $now, $nowPlus);
 
@@ -330,9 +367,8 @@ final class RelationalStore implements SchedulerStoreInterface
 
     /**
      * Take over the newest expired running row for this schedule, whatever its
-     * tick: a worker that died past the fire's grace window is otherwise
-     * never adopted and the fire is silently skipped. The adoption preserves
-     * the abandoned attempt's evidence in the row's attempts log.
+     * tick, appending the attempt it replaces to the row's attempts log; a
+     * run the attempt ceiling has spent is recorded failed in its place.
      *
      * @param DatabaseConnection $conn The claim's transaction
      * @param ScheduleDefinition $definition The schedule whose stale run is taken over
@@ -366,6 +402,13 @@ final class RelationalStore implements SchedulerStoreInterface
         }
 
         $abandoned = $this->hydrateRun($stale);
+
+        if ($abandoned->attempt >= $this->maxAttempts) {
+            $this->retireIfSpent($conn, $abandoned, $now);
+
+            return null;
+        }
+
         $adopted = $conn->affectingStatement(
             sprintf(
                 "UPDATE %s SET state = '%s', attempt = attempt + 1, claimed_by = ?, server_host = ?, started_at = %s, heartbeat_at = %s, lease_expires_at = %s, attempts = ?, finished_at = NULL, exit_code = NULL, duration_ms = NULL, output_tail = NULL, error = 'Abandoned: its lease expired before it finished.' WHERE id = ? AND attempt = ? AND state = '%s'",
@@ -398,8 +441,37 @@ final class RelationalStore implements SchedulerStoreInterface
     }
 
     /**
-     * The attempts log with one abandoned attempt appended: every adoption
-     * keeps the evidence of the attempt it replaces.
+     * Record as failed a run the attempt ceiling has spent, so the fire it
+     * held becomes history instead of a row every later claim takes up again.
+     * An expired lease is part of the guard: a live run at the ceiling runs on.
+     *
+     * @param DatabaseConnection $conn The claim's transaction
+     * @param RunRecord|null $run The run the claim could not adopt
+     * @param string $now The store's now expression
+     *
+     * @return void
+     */
+    private function retireIfSpent(DatabaseConnection $conn, RunRecord|null $run, string $now): void
+    {
+        if ($run === null || $run->state !== RunState::Running || $run->attempt < $this->maxAttempts) {
+            return;
+        }
+
+        $conn->affectingStatement(
+            sprintf(
+                "UPDATE %s SET state = 'failed', finished_at = %s, error = ? WHERE id = ? AND attempt = ? AND state = '%s' AND lease_expires_at <= %s",
+                SchedulerSchema::RUNS_TABLE,
+                $now,
+                self::STATE_RUNNING,
+                $now,
+            ),
+            [sprintf(self::SPENT_MESSAGE, $run->attempt), $run->id, $run->attempt],
+        );
+    }
+
+    /**
+     * The attempts log with the abandoned attempt appended, newest last and
+     * trimmed to the limit so one row can never outgrow its column.
      *
      * @param RunRecord|null $abandoned The attempt being replaced, null on a first claim
      *
@@ -411,14 +483,23 @@ final class RelationalStore implements SchedulerStoreInterface
             return '[]';
         }
 
-        return (string) json_encode([[
+        $log = json_decode((string) $abandoned->attempts, true);
+        $entries = is_array($log) ? $log : [];
+        $entries[] = [
             'attempt' => $abandoned->attempt,
             'claimed_by' => $abandoned->claimedBy,
             'started_at' => $abandoned->startedAt,
             'exit_code' => $abandoned->exitCode,
             'duration_ms' => $abandoned->durationMs,
             'error' => $abandoned->error,
-        ]], JSON_UNESCAPED_SLASHES);
+        ];
+
+        $encoded = json_encode(
+            array_values(array_slice($entries, -self::ATTEMPT_LOG_LIMIT)),
+            JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES,
+        );
+
+        return $encoded === false ? '[]' : $encoded;
     }
 
     /**
@@ -502,6 +583,45 @@ final class RelationalStore implements SchedulerStoreInterface
     }
 
     /**
+     * Answered whatever run happens to be the schedule's newest.
+     *
+     * @param string $scheduleId The schedule whose history is asked
+     * @param int $windowSeconds How far back a failure still counts
+     *
+     * @return bool True when a failed or expired run started inside the window.
+     */
+    public function hasRecentFailure(string $scheduleId, int $windowSeconds): bool
+    {
+        $this->ensureSchema();
+
+        return $this->connection->selectOne(
+            sprintf(
+                "SELECT 1 FROM %s WHERE schedule_id = ? AND state IN ('%s', '%s') AND started_at >= ? LIMIT 1",
+                SchedulerSchema::RUNS_TABLE,
+                RunState::Failed->value,
+                RunState::Expired->value,
+            ),
+            [$scheduleId, $this->cutoff($windowSeconds)],
+        ) !== null;
+    }
+
+    /**
+     * A moment this many seconds behind the store's clock, read once and
+     * handed back as a literal: a boundary the engine can seek to, which a
+     * clock expression written into the comparison is not.
+     *
+     * @param int $secondsBehind How far behind the store's clock
+     *
+     * @return string The moment in the store's stamp format.
+     */
+    private function cutoff(int $secondsBehind): string
+    {
+        $moment = $this->connection->selectOne(sprintf('SELECT %s AS cutoff', $this->dialect->nowMinus($secondsBehind)));
+
+        return $moment === null ? '' : Columns::string($moment, 'cutoff');
+    }
+
+    /**
      * @return int
      */
     public function liveRunCountForHost(string $serverHost): int
@@ -535,20 +655,47 @@ final class RelationalStore implements SchedulerStoreInterface
     }
 
     /**
+     * The retention window is measured from each run's start, a column every
+     * row carries. Batches read their slice by cursor and delete by id, so a
+     * large history costs many short statements rather than one long one.
+     *
      * @return int
      */
     public function pruneRuns(int $retentionDays): int
     {
         $this->ensureSchema();
-        $days = max(1, $retentionDays);
+        $candidates = $this->dialect->pruneCandidates(SchedulerSchema::RUNS_TABLE, max(1, $retentionDays) * 86400, self::PRUNE_BATCH_ROWS);
+        $deleted = 0;
+        $cursor = self::PRUNE_OLDEST;
+
+        do {
+            $rows = $this->connection->select($candidates, $cursor)->all();
+            $deleted += $this->deleteRuns(array_map(static fn(array $row): int => Columns::int($row, 'id'), $rows));
+            $last = end($rows);
+            $cursor = $last === false ? self::PRUNE_OLDEST : [Columns::string($last, 'started_at'), Columns::string($last, 'started_at'), Columns::int($last, 'id')];
+        } while (count($rows) === self::PRUNE_BATCH_ROWS);
+
+        return $deleted;
+    }
+
+    /**
+     * @param list<int> $ids The runs to delete, at most one batch
+     *
+     * @return int How many were deleted.
+     */
+    private function deleteRuns(array $ids): int
+    {
+        if ($ids === []) {
+            return 0;
+        }
 
         return $this->connection->affectingStatement(
             sprintf(
-                "DELETE FROM %s WHERE state <> '%s' AND COALESCE(finished_at, started_at) <= %s",
+                'DELETE FROM %s WHERE id IN (%s)',
                 SchedulerSchema::RUNS_TABLE,
-                self::STATE_RUNNING,
-                $this->dialect->nowMinus($days * 86400),
+                implode(', ', array_fill(0, count($ids), '?')),
             ),
+            $ids,
         );
     }
 
@@ -632,6 +779,29 @@ final class RelationalStore implements SchedulerStoreInterface
     }
 
     /**
+     * Whether the stored row already says exactly this schedule. A row that
+     * fails to read is never a match: saving over it is what repairs it.
+     *
+     * @param ScheduleDefinition $definition The definition about to be saved
+     *
+     * @return bool
+     */
+    private function isStored(ScheduleDefinition $definition): bool
+    {
+        try {
+            $stored = $this->definition($definition->id);
+        } catch (Throwable) {
+            return false;
+        }
+
+        return $stored !== null && $stored->matches($definition);
+    }
+
+    /**
+     * A schedule is expected to have fired only since it was last written:
+     * its definition or its resumption. Older stores carry no stamp and stay
+     * expected as before.
+     *
      * @param array<string, mixed> $row A scheduler_schedules row
      *
      * @return ScheduleDefinition
@@ -651,6 +821,7 @@ final class RelationalStore implements SchedulerStoreInterface
             graceSeconds: Columns::int($row, 'grace_seconds'),
             enabled: Columns::bool($row, 'enabled'),
             description: Columns::nullableString($row, 'description'),
+            expectedSince: Columns::instant($row, 'updated_at') ?? Columns::instant($row, 'created_at'),
         );
     }
 

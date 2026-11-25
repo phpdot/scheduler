@@ -44,7 +44,7 @@ final class PruneCommand extends Command
     protected function configure(): void
     {
         $this->addOption('stale-grace', null, InputOption::VALUE_REQUIRED, 'Seconds past lease expiry before a died fire closes', '300');
-        $this->addOption('days', null, InputOption::VALUE_REQUIRED, 'Delete terminal runs older than this many days', '30');
+        $this->addOption('days', null, InputOption::VALUE_REQUIRED, 'Delete terminal runs that started more than this many days ago; one day is the floor', '30');
     }
 
     /**
@@ -52,8 +52,14 @@ final class PruneCommand extends Command
      */
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $staleGrace = max(0, $this->intOption($input, 'stale-grace') ?? 300);
-        $days = max(0, $this->intOption($input, 'days') ?? 30);
+        $numbers = $this->intOptions($input, $output, ['stale-grace' => 300, 'days' => 30]);
+
+        if ($numbers === null) {
+            return self::FAILURE;
+        }
+
+        $staleGrace = max(0, $numbers['stale-grace'] ?? 300);
+        $days = max(1, $numbers['days'] ?? 30);
 
         $closed = $this->store->closeStaleRuns($staleGrace);
         $deleted = $this->store->pruneRuns($days);

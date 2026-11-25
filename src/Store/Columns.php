@@ -15,6 +15,9 @@ declare(strict_types=1);
 
 namespace PHPdot\Scheduler\Store;
 
+use DateTimeImmutable;
+use DateTimeZone;
+
 final class Columns
 {
     /**
@@ -104,5 +107,24 @@ final class Columns
         $value = $row[$key] ?? null;
 
         return $value === true || $value === 1 || $value === '1';
+    }
+
+    /**
+     * @param array<string, mixed> $row The row being read
+     * @param string $key The column holding a UTC stamp this package wrote
+     *
+     * @return DateTimeImmutable|null The stamp as an instant, null when absent or unreadable.
+     */
+    public static function instant(array $row, string $key): DateTimeImmutable|null
+    {
+        $stamp = self::nullableString($row, $key);
+
+        if ($stamp === null) {
+            return null;
+        }
+
+        $instant = DateTimeImmutable::createFromFormat('Y-m-d H:i:s', $stamp, new DateTimeZone('UTC'));
+
+        return $instant === false ? null : $instant;
     }
 }

@@ -16,6 +16,7 @@ use DateTimeImmutable;
 use DateTimeZone;
 use PHPdot\Console\Command;
 use PHPdot\Scheduler\Contract\SchedulerStoreInterface;
+use PHPdot\Scheduler\Exception\InvalidDefinitionException;
 use PHPdot\Scheduler\Exception\SchedulerException;
 use PHPdot\Scheduler\Exception\UnknownPresetException;
 use PHPdot\Scheduler\Schedule\CollisionCheck;
@@ -74,80 +75,64 @@ final class DefineCommand extends Command
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $id = $this->stringArgument($input, 'id');
-        $existing = $this->store->definition($id);
-        $command = $this->stringArgument($input, 'cmd');
+        $numbers = $this->intOptions($input, $output, ['timeout' => null, 'idle-timeout' => null, 'grace' => null]);
 
-        if ($command === '') {
-            $command = $existing !== null ? $existing->command : $this->catalogCommand($id);
-        }
-
-        if ($id === '' || $command === null) {
-            $this->error($output, 'A new schedule needs a command: pass one, or run scheduler:sync and use a catalog name as the id.');
-
+        if ($numbers === null) {
             return self::FAILURE;
         }
 
-        $cron = $this->textOption($input, 'cron');
-        $every = $this->textOption($input, 'every');
-        $preset = $this->textOption($input, 'preset');
-
-        $chosen = array_filter(
-            ['cron' => $cron, 'every' => $every, 'preset' => $preset],
-            static fn(string|null $value): bool => $value !== null,
+        $timings = array_filter(
+            ['cron' => $this->textOption($input, 'cron'), 'every' => $this->textOption($input, 'every'), 'preset' => $this->textOption($input, 'preset')],
+            static fn(string|null $timing): bool => $timing !== null,
         );
 
-        if (count($chosen) > 1) {
-            $this->error($output, sprintf('Choose exactly one timing — you passed --%s.', implode(' and --', array_keys($chosen))));
-
-            return self::FAILURE;
-        }
-
-        $pattern = match (true) {
-            $cron !== null => Pattern::cron($cron),
-            $every !== null => Pattern::every($every),
-            $preset !== null => $this->presetPattern($preset, $id),
-            $existing !== null => $existing->pattern,
-            default => null,
-        };
-
-        if ($pattern === null) {
-            $this->error($output, 'A new schedule needs a timing: --cron, --every, or --preset.');
+        if (count($timings) > 1) {
+            $this->error($output, sprintf('Choose exactly one timing — you passed --%s.', implode(' and --', array_keys($timings))));
 
             return self::FAILURE;
         }
 
         try {
-            $timezoneName = $this->textOption($input, 'timezone')
-                ?? ($existing !== null ? $existing->timezone->getName() : 'UTC');
-            $overlapName = strtolower(
-                $this->textOption($input, 'overlap')
-                    ?? ($existing !== null ? $existing->overlap->value : OverlapPolicy::Forbid->value),
-            );
+            $existing = $this->store->definition($id);
+            $command = $this->stringArgument($input, 'cmd');
+
+            if ($command === '') {
+                $command = $existing !== null ? $existing->command : $this->catalogCommand($id);
+            }
+
+            if ($id === '' || $command === null) {
+                $this->error($output, 'A new schedule needs a command: pass one, or run scheduler:sync and use a catalog name as the id.');
+
+                return self::FAILURE;
+            }
+
+            $pattern = match (true) {
+                isset($timings['cron']) => Pattern::cron($timings['cron']),
+                isset($timings['every']) => Pattern::every($timings['every']),
+                isset($timings['preset']) => $this->presetPattern($timings['preset'], $id),
+                default => $existing === null ? null : $existing->pattern,
+            };
+
+            if ($pattern === null) {
+                $this->error($output, 'A new schedule needs a timing: --cron, --every, or --preset.');
+
+                return self::FAILURE;
+            }
 
             $definition = new ScheduleDefinition(
                 id: $id,
                 command: $command,
                 pattern: $pattern,
-                timezone: new DateTimeZone($timezoneName),
-                timeoutSeconds: $this->intOption($input, 'timeout')
-                    ?? ($existing !== null ? $existing->timeoutSeconds : 300),
-                idleTimeoutSeconds: $this->intOption($input, 'idle-timeout')
-                    ?? ($existing !== null ? $existing->idleTimeoutSeconds : null),
-                overlap: OverlapPolicy::from($overlapName),
-                graceSeconds: $this->intOption($input, 'grace')
-                    ?? ($existing !== null ? $existing->graceSeconds : 90),
-                enabled: $this->flagOption($input, 'disabled')
-                    ? false
-                    : ($existing !== null ? $existing->enabled : true),
-                description: $this->textOption($input, 'description')
-                    ?? ($existing !== null ? $existing->description : null),
+                timezone: new DateTimeZone($this->textOption($input, 'timezone') ?? ($existing !== null ? $existing->timezone->getName() : 'UTC')),
+                timeoutSeconds: $numbers['timeout'] ?? ($existing !== null ? $existing->timeoutSeconds : 300),
+                idleTimeoutSeconds: $numbers['idle-timeout'] ?? ($existing === null ? null : $existing->idleTimeoutSeconds),
+                graceSeconds: $numbers['grace'] ?? ($existing !== null ? $existing->graceSeconds : 90),
+                overlap: $this->overlap($input, $existing !== null ? $existing->overlap : OverlapPolicy::Forbid),
+                enabled: $this->flagOption($input, 'disabled') ? false : ($existing === null || $existing->enabled),
+                description: $this->textOption($input, 'description') ?? ($existing === null ? null : $existing->description),
             );
 
             $this->store->saveDefinition($definition);
-        } catch (SchedulerException $e) {
-            $this->error($output, $e->getMessage());
-
-            return self::FAILURE;
         } catch (Throwable $e) {
             $this->error($output, $e->getMessage());
 
@@ -171,6 +156,21 @@ final class DefineCommand extends Command
         ]]);
 
         return self::SUCCESS;
+    }
+
+    /**
+     * @param InputInterface $input The console input
+     * @param OverlapPolicy $fallback The policy kept when none is passed
+     *
+     * @throws InvalidDefinitionException When the passed name is neither forbid nor allow.
+     *
+     * @return OverlapPolicy
+     */
+    private function overlap(InputInterface $input, OverlapPolicy $fallback): OverlapPolicy
+    {
+        $name = strtolower($this->textOption($input, 'overlap') ?? $fallback->value);
+
+        return OverlapPolicy::tryFrom($name) ?? throw InvalidDefinitionException::forField('overlap', '"forbid" or "allow"');
     }
 
     /**

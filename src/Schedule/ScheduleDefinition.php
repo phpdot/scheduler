@@ -12,6 +12,7 @@ declare(strict_types=1);
 
 namespace PHPdot\Scheduler\Schedule;
 
+use DateTimeImmutable;
 use DateTimeZone;
 use PHPdot\Scheduler\Exception\InvalidDefinitionException;
 
@@ -28,6 +29,7 @@ final readonly class ScheduleDefinition
      * @param int $graceSeconds How late a missed fire may still be claimed
      * @param bool $enabled Paused schedules stay stored but never fire
      * @param string|null $description Human-facing note
+     * @param DateTimeImmutable|null $expectedSince When the schedule last became expected to fire: its latest redefinition or resumption
      *
      * @throws InvalidDefinitionException When a field fails validation.
      */
@@ -42,6 +44,7 @@ final readonly class ScheduleDefinition
         public int $graceSeconds = 90,
         public bool $enabled = true,
         public string|null $description = null,
+        public DateTimeImmutable|null $expectedSince = null,
     ) {
         if (preg_match('/^[A-Za-z0-9_.:\-]{1,64}$/', $id) !== 1) {
             throw InvalidDefinitionException::forField('id', '1-64 of letters, digits, dot, colon, underscore or dash');
@@ -82,6 +85,29 @@ final readonly class ScheduleDefinition
             graceSeconds: $this->graceSeconds,
             enabled: $enabled,
             description: $this->description,
+            expectedSince: $this->expectedSince,
         );
+    }
+
+    /**
+     * Whether two definitions say the same thing, timing, policies and state
+     * included; the stamps that say when each was written do not count.
+     *
+     * @param ScheduleDefinition $other The definition compared against
+     *
+     * @return bool
+     */
+    public function matches(ScheduleDefinition $other): bool
+    {
+        return $this->id === $other->id
+            && $this->command === $other->command
+            && $this->pattern->expression === $other->pattern->expression
+            && $this->timezone->getName() === $other->timezone->getName()
+            && $this->timeoutSeconds === $other->timeoutSeconds
+            && $this->idleTimeoutSeconds === $other->idleTimeoutSeconds
+            && $this->overlap === $other->overlap
+            && $this->graceSeconds === $other->graceSeconds
+            && $this->enabled === $other->enabled
+            && $this->description === $other->description;
     }
 }

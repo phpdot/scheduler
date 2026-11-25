@@ -18,6 +18,7 @@ enum TickResult: string
     case OverlapSkipped = 'overlap_skipped';
     case ClaimLost = 'claim_lost';
     case PatternError = 'pattern_error';
+    case StoreError = 'store_error';
     case Succeeded = 'succeeded';
     case Failed = 'failed';
     case TimedOut = 'timed_out';

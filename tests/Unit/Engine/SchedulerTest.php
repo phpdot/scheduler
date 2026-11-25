@@ -9,6 +9,7 @@ use DateTimeImmutable;
 use PHPdot\Scheduler\Config\SchedulerConfig;
 use PHPdot\Scheduler\Contract\TaskRunnerInterface;
 use PHPdot\Scheduler\Engine\Scheduler;
+use PHPdot\Scheduler\Engine\TickOutcome;
 use PHPdot\Scheduler\Engine\TickResult;
 use PHPdot\Scheduler\Run\RunState;
 use PHPdot\Scheduler\Runner\RunnerOutcome;
@@ -163,6 +164,7 @@ final class SchedulerTest extends TestCase
         $report = $engine->tick(new DateTimeImmutable('2026-09-05T12:34:10+00:00'));
 
         self::assertSame(TickResult::Fenced, $report->outcomes[0]->result);
+        self::assertSame('a newer attempt owns the run', $report->outcomes[0]->detail);
     }
 
     #[Test]
@@ -271,7 +273,56 @@ final class SchedulerTest extends TestCase
         $report = $engine->tick(new DateTimeImmutable('2026-09-05T12:34:10+00:00'));
 
         self::assertSame(TickResult::Fenced, $report->outcomes[0]->result);
+        self::assertSame('the outcome could not be recorded; the run will be adopted and run again', $report->outcomes[0]->detail);
         self::assertSame(RunState::Running, $store->runs['every-minute|2026-09-05T12:34:00+00:00']->state);
+    }
+
+    #[Test]
+    public function aStoreFailureCostsOnlyItsOwnScheduleThePass(): void
+    {
+        $store = new FakeStore();
+
+        foreach (['a-first', 'm-middle', 'z-last'] as $id) {
+            $store->saveDefinition(new ScheduleDefinition(
+                id: $id,
+                command: 'dot ' . $id,
+                pattern: Pattern::every('60s'),
+            ));
+        }
+
+        $store->failingSchedules = ['m-middle'];
+        $runner = new FakeRunner();
+        $engine = new Scheduler($store, $runner, new SchedulerConfig());
+
+        $report = $engine->tick(new DateTimeImmutable('2026-09-05T12:34:10+00:00'));
+
+        self::assertSame(
+            [TickResult::Succeeded, TickResult::StoreError, TickResult::Succeeded],
+            array_map(static fn(TickOutcome $outcome): TickResult => $outcome->result, $report->outcomes),
+        );
+        self::assertSame('Lock wait timeout exceeded', $report->outcomes[1]->detail);
+        self::assertSame(['dot a-first', 'dot z-last'], array_map(static fn(TaskSpec $task): string => $task->command, $runner->tasks));
+    }
+
+    #[Test]
+    public function aClaimedTaskIsToldWhichFireItRuns(): void
+    {
+        $store = new FakeStore();
+        $store->saveDefinition(new ScheduleDefinition(
+            id: 'nightly',
+            command: 'dot nightly',
+            pattern: Pattern::cron('0 3 * * *'),
+        ));
+        $store->nextAttempt = 2;
+        $runner = new FakeRunner();
+        $engine = new Scheduler($store, $runner, new SchedulerConfig());
+
+        $engine->trigger('nightly', new DateTimeImmutable('2026-09-05T12:00:00+00:00'));
+
+        self::assertCount(1, $runner->tasks);
+        self::assertSame('nightly', $runner->tasks[0]->scheduleId);
+        self::assertSame('2026-09-05T12:00:00+00:00', $runner->tasks[0]->tick);
+        self::assertSame(2, $runner->tasks[0]->attempt);
     }
 
     #[Test]
@@ -313,7 +364,8 @@ final class SchedulerTest extends TestCase
 
         $outcome = $engine->trigger('nightly', new DateTimeImmutable('2026-09-05T12:00:00+00:00'));
 
-        self::assertSame(TickResult::Succeeded, $outcome?->result);
-        self::assertSame('2026-09-05T12:00:00+00:00', $outcome?->tick);
+        self::assertNotNull($outcome);
+        self::assertSame(TickResult::Succeeded, $outcome->result);
+        self::assertSame('2026-09-05T12:00:00+00:00', $outcome->tick);
     }
 }

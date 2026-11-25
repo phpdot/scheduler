@@ -7,19 +7,23 @@ namespace PHPdot\Scheduler\Tests\Integration\PostgreSql;
 use PHPdot\Database\Connection\Postgres\PostgresConfig;
 use PHPdot\Database\DatabaseConnection;
 use PHPdot\Scheduler\Tests\Integration\RelationalStoreTestCase;
+use PHPdot\Scheduler\Tests\Support\RacesARival;
 use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\Test;
 
 #[Group('integration')]
 final class RelationalStoreTest extends RelationalStoreTestCase
 {
+    use RacesARival;
+
     protected function createConnection(): DatabaseConnection
     {
         return new DatabaseConnection(new PostgresConfig(
-            database: getenv('PG_DB') ?: 'phpdot_test',
-            host: getenv('PG_HOST') ?: '127.0.0.1',
-            port: (int) (getenv('PG_PORT') ?: 5432),
-            username: getenv('PG_USER') ?: 'postgres',
-            password: getenv('PG_PASS') ?: 'postgres',
+            database: $this->setting('PG_DB', 'phpdot_test'),
+            host: $this->setting('PG_HOST', '127.0.0.1'),
+            port: (int) $this->setting('PG_PORT', '5432'),
+            username: $this->setting('PG_USER', 'postgres'),
+            password: $this->setting('PG_PASS', 'postgres'),
         ));
     }
 
@@ -30,5 +34,12 @@ final class RelationalStoreTest extends RelationalStoreTestCase
         }
 
         self::markTestSkipped($reason);
+    }
+
+    #[Test]
+    public function theOverlapGuardHoldsUnderAStricterIsolation(): void
+    {
+        self::assertSame('refused', $this->rivalVerdict('repeatable read', 1));
+        self::assertSame('refused', $this->rivalVerdict('serializable', 2));
     }
 }

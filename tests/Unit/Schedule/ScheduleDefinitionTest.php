@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace PHPdot\Scheduler\Tests\Unit\Schedule;
 
+use DateTimeImmutable;
+use DateTimeZone;
 use PHPdot\Scheduler\Exception\InvalidDefinitionException;
 use PHPdot\Scheduler\Schedule\OverlapPolicy;
 use PHPdot\Scheduler\Schedule\Pattern;
@@ -78,5 +80,53 @@ final class ScheduleDefinitionTest extends TestCase
         self::assertSame($definition->command, $paused->command);
         self::assertSame($definition->timeoutSeconds, $paused->timeoutSeconds);
         self::assertSame($definition->pattern->expression, $paused->pattern->expression);
+    }
+
+    #[Test]
+    public function withEnabledCarriesWhenTheScheduleBecameExpected(): void
+    {
+        $expectedSince = new DateTimeImmutable('2026-09-05T10:00:00+00:00');
+        $definition = new ScheduleDefinition(
+            id: 'reports:generate',
+            command: 'dot reports:generate',
+            pattern: Pattern::every('60s'),
+            expectedSince: $expectedSince,
+        );
+
+        self::assertSame($expectedSince, $definition->withEnabled(false)->expectedSince);
+    }
+
+    #[Test]
+    public function definitionsMatchOnWhatTheySayNotOnWhenTheyWereWritten(): void
+    {
+        $definition = new ScheduleDefinition(
+            id: 'reports:generate',
+            command: 'dot reports:generate',
+            pattern: Pattern::every('60s'),
+            expectedSince: new DateTimeImmutable('2026-09-05T10:00:00+00:00'),
+        );
+
+        self::assertTrue($definition->matches(new ScheduleDefinition(
+            id: 'reports:generate',
+            command: 'dot reports:generate',
+            pattern: Pattern::every('60s'),
+            expectedSince: new DateTimeImmutable('2026-10-01T10:00:00+00:00'),
+        )));
+
+        $different = [
+            'command' => new ScheduleDefinition(id: 'reports:generate', command: 'dot reports', pattern: Pattern::every('60s')),
+            'timing' => new ScheduleDefinition(id: 'reports:generate', command: 'dot reports:generate', pattern: Pattern::every('30s')),
+            'timeout' => new ScheduleDefinition(id: 'reports:generate', command: 'dot reports:generate', pattern: Pattern::every('60s'), timeoutSeconds: 60),
+            'idle timeout' => new ScheduleDefinition(id: 'reports:generate', command: 'dot reports:generate', pattern: Pattern::every('60s'), idleTimeoutSeconds: 30),
+            'overlap' => new ScheduleDefinition(id: 'reports:generate', command: 'dot reports:generate', pattern: Pattern::every('60s'), overlap: OverlapPolicy::Allow),
+            'grace' => new ScheduleDefinition(id: 'reports:generate', command: 'dot reports:generate', pattern: Pattern::every('60s'), graceSeconds: 10),
+            'state' => new ScheduleDefinition(id: 'reports:generate', command: 'dot reports:generate', pattern: Pattern::every('60s'), enabled: false),
+            'description' => new ScheduleDefinition(id: 'reports:generate', command: 'dot reports:generate', pattern: Pattern::every('60s'), description: 'Nightly'),
+            'zone' => new ScheduleDefinition(id: 'reports:generate', command: 'dot reports:generate', pattern: Pattern::every('60s'), timezone: new DateTimeZone('Asia/Amman')),
+        ];
+
+        foreach ($different as $field => $other) {
+            self::assertFalse($definition->matches($other), $field);
+        }
     }
 }

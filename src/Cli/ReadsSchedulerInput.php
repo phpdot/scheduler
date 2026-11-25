@@ -13,6 +13,7 @@ declare(strict_types=1);
 namespace PHPdot\Scheduler\Cli;
 
 use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Output\OutputInterface;
 
 trait ReadsSchedulerInput
 {
@@ -47,20 +48,39 @@ trait ReadsSchedulerInput
     }
 
     /**
-     * @param InputInterface $input The console input
-     * @param string $name The option name
+     * Read integer options by name, each taking its default when absent; a
+     * malformed value is reported once and answers null, so no typo quietly
+     * becomes a default.
      *
-     * @return int|null The numeric option, null when absent or malformed.
+     * @param array<string, int|null> $defaults The value each option takes when absent
+     *
+     * @return array<string, int|null>|null The values by name, null when one was malformed.
      */
-    protected function intOption(InputInterface $input, string $name): null|int
+    protected function intOptions(InputInterface $input, OutputInterface $output, array $defaults): array|null
     {
-        $value = $input->getOption($name);
+        $values = [];
 
-        if (!is_numeric($value)) {
-            return null;
+        foreach ($defaults as $name => $default) {
+            $given = $input->getOption($name);
+
+            if (!is_string($given) || trim($given) === '') {
+                $values[$name] = $default;
+
+                continue;
+            }
+
+            $given = trim($given);
+
+            if (preg_match('/^-?\d+$/', $given) !== 1) {
+                $this->error($output, sprintf('Option "--%s" needs a whole number, not "%s".', $name, $given));
+
+                return null;
+            }
+
+            $values[$name] = (int) $given;
         }
 
-        return (int) $value;
+        return $values;
     }
 
     /**

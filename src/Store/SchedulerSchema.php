@@ -3,8 +3,11 @@
 declare(strict_types=1);
 
 /**
- * Owns the three scheduler tables: creates, drops, and versions them, so a
- * mixed-version fleet fails loudly instead of corrupting claims.
+ * Owns the four scheduler tables: creates, drops, and versions them, so a
+ * mixed-version fleet fails loudly instead of corrupting claims. The stamp
+ * moves only when the contract breaks; an additive change — an index, a
+ * nullable column — reaches an existing store through install() without one,
+ * so servers on the previous release keep working beside it.
  *
  * @author Omar Hamdan <omar@phpdot.com>
  * @license MIT
@@ -30,12 +33,30 @@ final class SchedulerSchema
 
     private const string VERSION_KEY = 'schema_version';
 
+    private readonly Dialect $dialect;
+
+    /**
+     * The runs table's plain indexes by name, each answering one of the
+     * store's reads as a single range.
+     *
+     * @var array<string, list<string>>
+     */
+    private const array RUN_INDEXES = [
+        'scheduler_runs_schedule_idx' => ['schedule_id'],
+        'scheduler_runs_host_state_lease_idx' => ['server_host', 'state', 'lease_expires_at'],
+        'scheduler_runs_schedule_state_started_idx' => ['schedule_id', 'state', 'started_at'],
+        'scheduler_runs_state_lease_idx' => ['state', 'lease_expires_at'],
+        'scheduler_runs_started_idx' => ['started_at', 'id'],
+    ];
+
     /**
      * @param DatabaseConnection $connection The store's connection
      */
     public function __construct(
         private readonly DatabaseConnection $connection,
-    ) {}
+    ) {
+        $this->dialect = new Dialect($connection->getDriverName());
+    }
 
     /**
      * @return void
@@ -80,8 +101,10 @@ final class SchedulerSchema
                 $table->text('output_tail')->nullable();
                 $table->text('error')->nullable();
                 $table->unique(['schedule_id', 'tick'], 'scheduler_runs_schedule_tick_unique');
-                $table->index(['schedule_id'], 'scheduler_runs_schedule_idx');
-                $table->index(['server_host', 'state', 'lease_expires_at'], 'scheduler_runs_host_state_lease_idx');
+
+                foreach (self::RUN_INDEXES as $name => $columns) {
+                    $table->index($columns, $name);
+                }
             });
         }
 
@@ -113,6 +136,8 @@ final class SchedulerSchema
             );
         }
 
+        $this->addMissingRunIndexes();
+
         if ($version === null) {
             $this->connection->affectingStatement(
                 sprintf('INSERT INTO %s (meta_key, meta_value) VALUES (?, ?)', self::META_TABLE),
@@ -128,6 +153,33 @@ final class SchedulerSchema
                 [(string) self::VERSION, self::VERSION_KEY],
             );
         }
+    }
+
+    /**
+     * Create the run indexes an older store lacks, each once.
+     *
+     * @return void
+     */
+    private function addMissingRunIndexes(): void
+    {
+        foreach (self::RUN_INDEXES as $name => $columns) {
+            if (!$this->hasIndex(self::RUNS_TABLE, $name)) {
+                $this->connection->schema()->table(self::RUNS_TABLE, static function (Blueprint $table) use ($columns, $name): void {
+                    $table->index($columns, $name);
+                });
+            }
+        }
+    }
+
+    /**
+     * @param string $table The table carrying the index
+     * @param string $index The index name
+     *
+     * @return bool True when the index exists.
+     */
+    private function hasIndex(string $table, string $index): bool
+    {
+        return $this->connection->selectOne($this->dialect->indexLookup($table, $index), [$table, $index]) !== null;
     }
 
     /**

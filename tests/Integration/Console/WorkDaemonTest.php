@@ -62,7 +62,9 @@ final class WorkDaemonTest extends TestCase
             self::assertSame(0, $exit);
             self::assertStringContainsString('stopped — running tasks were stopped and recorded.', $output);
 
-            $runs = $watcher?->runs('long-task', 5) ?? [];
+            self::assertInstanceOf(RelationalStore::class, $watcher);
+
+            $runs = $watcher->runs('long-task', 5);
 
             self::assertCount(1, $runs);
             self::assertSame(RunState::Failed, $runs[0]->state);

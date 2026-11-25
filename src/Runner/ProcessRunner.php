@@ -4,8 +4,9 @@ declare(strict_types=1);
 
 /**
  * Executes claimed tasks through symfony/process under the safety contract:
- * a hard timeout on every command, escalation from SIGTERM to SIGKILL, and a
- * stop-everything path for host shutdown.
+ * a hard timeout on every command, escalation from SIGTERM to SIGKILL across
+ * the whole process tree, and a stop-everything path for host shutdown. Each
+ * command is told its schedule, tick and attempt through the environment.
  *
  * @author Omar Hamdan <omar@phpdot.com>
  * @license MIT
@@ -26,10 +27,40 @@ final class ProcessRunner implements TaskRunnerInterface
 
     private const int STOP_GRACE_SECONDS = 5;
 
+    /**
+     * The POSIX signal numbers themselves rather than ext-pcntl's constants:
+     * a PHP build without that extension, which is every official image, must
+     * still be able to stop a command.
+     */
+    private const int SIGNAL_TERMINATE = 15;
+
+    private const int SIGNAL_KILL = 9;
+
+    private const string ENV_SCHEDULE = 'SCHEDULER_SCHEDULE';
+
+    private const string ENV_TICK = 'SCHEDULER_TICK';
+
+    private const string ENV_ATTEMPT = 'SCHEDULER_ATTEMPT';
+
+    private const string UNLISTED_NOTE = 'The process tree could not be listed on this host, so child processes may outlive the command.';
+
     private bool $stopping = false;
+
+    private bool $unlisted = false;
 
     /** @var list<Process> */
     private array $live = [];
+
+    /** @var Closure(int): (list<int>|null) */
+    private readonly Closure $listDescendants;
+
+    /**
+     * @param Closure(int): (list<int>|null)|null $listDescendants Answers every descendant of a pid, null for the host's own
+     */
+    public function __construct(Closure|null $listDescendants = null)
+    {
+        $this->listDescendants = $listDescendants ?? ProcessTable::descendants(...);
+    }
 
     /**
      * @param TaskSpec $task What to execute and under which limits
@@ -39,13 +70,14 @@ final class ProcessRunner implements TaskRunnerInterface
      */
     public function run(TaskSpec $task, Closure|null $onPoll = null): RunnerResult
     {
-        $process = Process::fromShellCommandline($task->command, $task->cwd, $task->env);
+        $process = Process::fromShellCommandline($task->command, $task->cwd, $this->environment($task));
 
         $startedAt = microtime(true);
         $lastOutputAt = $startedAt;
         $outcome = RunnerOutcome::Completed;
         $error = null;
         $this->stopping = false;
+        $this->unlisted = false;
         $tail = '';
 
         try {
@@ -118,6 +150,10 @@ final class ProcessRunner implements TaskRunnerInterface
             $error = sprintf('Exited with code %s.', $exitCode === null ? 'unknown' : (string) $exitCode);
         }
 
+        if ($this->unlisted && $error !== null) {
+            $error .= ' ' . self::UNLISTED_NOTE;
+        }
+
         return new RunnerResult(
             outcome: $outcome,
             exitCode: $exitCode,
@@ -142,93 +178,52 @@ final class ProcessRunner implements TaskRunnerInterface
     }
 
     /**
-     * Stop a command and everything it spawned: the shell's own children are
-     * orphans to symfony's single-process stop, so the tree is walked with
-     * pgrep and signalled parent-first, escalating to SIGKILL after the
-     * grace window. Children a pgrep-less platform hides survive — run under
-     * a supervisor when that gap cannot be tolerated.
+     * Stop a command and everything it spawned. The tree is captured before
+     * the first signal, because the shell's death re-parents its children;
+     * after a grace window it is listed again for children forked meanwhile,
+     * and the kill reaches only members still running as the processes they
+     * were captured as.
      *
      * @param Process $process The command being stopped
-     * @param int $grace Seconds between SIGTERM and SIGKILL
+     * @param int $grace Seconds to wait after SIGTERM before SIGKILL
      *
      * @return void
      */
     private function terminateTree(Process $process, int $grace): void
     {
-        $tree = $this->treePids($process->getPid());
-        $this->signalAll($tree, SIGTERM);
+        $tree = ProcessTree::under($process->getPid(), $this->listDescendants);
+        $tree->signal(self::SIGNAL_TERMINATE);
 
         if ($grace > 0) {
-            usleep($grace * 1000000);
+            $tree->awaitExit($grace);
+            $tree = $tree->regrown($this->listDescendants);
         }
 
-        $this->signalAll($tree, SIGKILL);
+        $tree->escalate(self::SIGNAL_KILL);
+        $this->unlisted = $this->unlisted || !$tree->walked;
         $process->stop(0);
     }
 
     /**
-     * The command's whole tree, parent first: collected before any signal is
-     * delivered, because the shell's death re-parents its children and hides
-     * them from pgrep.
+     * The command's environment: the configured variables plus what the
+     * command is told about its own fire, which the schedule always decides.
      *
-     * @param int|null $pid The command's own pid
+     * @param TaskSpec $task The task about to run
      *
-     * @return list<int> The tree's pids, the command itself first.
+     * @return array<string, string>
      */
-    private function treePids(int|null $pid): array
+    private function environment(TaskSpec $task): array
     {
-        if ($pid === null || !function_exists('posix_kill')) {
-            return [];
+        if ($task->tick === null) {
+            return $task->env;
         }
 
-        return [$pid, ...$this->descendantPids($pid)];
-    }
-
-    /**
-     * @param list<int> $pids The tree members being signalled
-     * @param int $signal The signal every member receives
-     *
-     * @return void
-     */
-    private function signalAll(array $pids, int $signal): void
-    {
-        foreach ($pids as $pid) {
-            if ($pid > 0) {
-                @posix_kill($pid, $signal);
-            }
-        }
-    }
-
-    /**
-     * @param int $pid The process whose descendants are collected
-     *
-     * @return list<int> Depth-first, newest descendant last.
-     */
-    private function descendantPids(int $pid): array
-    {
-        $lister = new Process(['pgrep', '-P', (string) $pid]);
-        $lister->start();
-        $lister->wait();
-
-        $children = [];
-
-        $listed = preg_split('/\s+/', trim($lister->getOutput()));
-        $chunks = $listed === false ? [] : $listed;
-
-        foreach ($chunks as $chunk) {
-            if (ctype_digit($chunk)) {
-                $children[] = (int) $chunk;
-            }
-        }
-
-        $pids = [];
-
-        foreach ($children as $child) {
-            $pids[] = $child;
-            $pids = [...$pids, ...$this->descendantPids($child)];
-        }
-
-        return $pids;
+        return [
+            ...$task->env,
+            self::ENV_SCHEDULE => $task->scheduleId ?? '',
+            self::ENV_TICK => $task->tick,
+            self::ENV_ATTEMPT => (string) $task->attempt,
+        ];
     }
 
     /**
@@ -300,5 +295,4 @@ final class ProcessRunner implements TaskRunnerInterface
             static fn(Process $tracked): bool => $tracked !== $process,
         ));
     }
-
 }

@@ -72,7 +72,13 @@ final class WorkCommand extends Command
             return self::FAILURE;
         }
 
-        $interval = max(1, $this->intOption($input, 'interval') ?? $this->config->workIntervalSeconds);
+        $numbers = $this->intOptions($input, $output, ['interval' => $this->config->workIntervalSeconds]);
+
+        if ($numbers === null) {
+            return self::FAILURE;
+        }
+
+        $interval = max(1, $numbers['interval'] ?? $this->config->workIntervalSeconds);
 
         pcntl_async_signals(true);
         pcntl_signal(SIGTERM, function (): void {

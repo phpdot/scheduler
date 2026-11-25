@@ -52,10 +52,13 @@ final class RunsCommand extends Command
      */
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $runs = $this->store->runs(
-            $this->textOption($input, 'schedule'),
-            max(1, $this->intOption($input, 'limit') ?? 20),
-        );
+        $numbers = $this->intOptions($input, $output, ['limit' => 20]);
+
+        if ($numbers === null) {
+            return self::FAILURE;
+        }
+
+        $runs = $this->store->runs($this->textOption($input, 'schedule'), max(1, $numbers['limit'] ?? 20));
 
         if ($runs === []) {
             $this->comment($output, 'No runs recorded.');

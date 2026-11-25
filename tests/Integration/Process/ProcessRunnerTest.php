@@ -7,11 +7,14 @@ namespace PHPdot\Scheduler\Tests\Integration\Process;
 use PHPdot\Scheduler\Runner\ProcessRunner;
 use PHPdot\Scheduler\Runner\RunnerOutcome;
 use PHPdot\Scheduler\Runner\TaskSpec;
+use PHPdot\Scheduler\Tests\Support\AwaitsExit;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
 final class ProcessRunnerTest extends TestCase
 {
+    use AwaitsExit;
+
     #[Test]
     public function aCompletingCommandCarriesItsOutputAndExitCode(): void
     {
@@ -70,7 +73,7 @@ final class ProcessRunnerTest extends TestCase
 
         self::assertSame(RunnerOutcome::Interrupted, $result->outcome);
         self::assertSame('Stopped for host shutdown.', $result->error);
-        self::assertLessThan(10000, $result->durationMs);
+        self::assertLessThan(3000, $result->durationMs);
     }
 
     #[Test]
@@ -117,7 +120,7 @@ final class ProcessRunnerTest extends TestCase
     public function aMultibyteCharacterSplitByTheTailWindowIsRepaired(): void
     {
         $result = (new ProcessRunner())->run(new TaskSpec(
-            "printf 'a%.0s' {1..8190} && printf '\xf0\x9f\x93\x85' && echo end-marker",
+            "awk 'BEGIN { for (i = 0; i < 8190; i++) printf \"a\" }' && printf '\360\237\223\205' && echo end-marker",
             10,
             null,
             null,
@@ -141,6 +144,85 @@ final class ProcessRunnerTest extends TestCase
         self::assertSame(RunnerOutcome::Interrupted, $result->outcome);
         self::assertStringContainsString('adopted elsewhere', (string) $result->error);
         self::assertLessThan(10000, $result->durationMs);
+    }
+
+    #[Test]
+    public function aChildThatIgnoresTerminationIsKilledAfterTheGrace(): void
+    {
+        $runner = new ProcessRunner();
+        $marker = sys_get_temp_dir() . '/scheduler-stubborn-' . uniqid();
+        $ready = $marker . '.ready';
+        $result = $runner->run(new TaskSpec(
+            sprintf('trap "" TERM; touch %1$s; sleep 60 & echo $! > %2$s; wait', escapeshellarg($ready), escapeshellarg($marker)),
+            30,
+            null,
+            null,
+        ), static function () use ($runner, $ready): bool {
+            if (!file_exists($ready)) {
+                return true;
+            }
+
+            $runner->stopAll();
+
+            return false;
+        });
+
+        $child = (int) trim((string) @file_get_contents($marker));
+        @unlink($marker);
+        @unlink($ready);
+
+        self::assertSame(RunnerOutcome::Interrupted, $result->outcome);
+        self::assertGreaterThanOrEqual(4500, $result->durationMs);
+        self::assertLessThan(9000, $result->durationMs);
+        self::assertTrue($this->exitsWithin($child), 'a child that ignored SIGTERM outlived the grace window');
+    }
+
+    #[Test]
+    public function aTreeTheHostCannotListIsReportedOnTheResult(): void
+    {
+        $runner = new ProcessRunner(static fn(int $pid): null => null);
+        $marker = sys_get_temp_dir() . '/scheduler-unlisted-' . uniqid();
+        $result = $runner->run(new TaskSpec(
+            sprintf('sleep 60 & echo $! > %s; wait', escapeshellarg($marker)),
+            1,
+            null,
+            null,
+        ));
+
+        $child = (int) trim((string) @file_get_contents($marker));
+        @unlink($marker);
+        $survived = $child > 0 && posix_kill($child, 0);
+        @posix_kill($child, 9);
+
+        self::assertSame(RunnerOutcome::TimedOut, $result->outcome);
+        self::assertStringContainsString('could not be listed', (string) $result->error);
+        self::assertTrue($survived, 'with no listing only the shell itself is stopped');
+    }
+
+    #[Test]
+    public function aCommandIsToldWhichFireItRuns(): void
+    {
+        $result = (new ProcessRunner())->run(new TaskSpec(
+            'printf "%s|%s|%s" "$SCHEDULER_SCHEDULE" "$SCHEDULER_TICK" "$SCHEDULER_ATTEMPT"',
+            10,
+            null,
+            null,
+            ['SCHEDULER_TICK' => 'overridden-by-the-schedule'],
+            'reports:generate',
+            '2026-09-05T12:00:00+00:00',
+            3,
+        ));
+
+        self::assertSame(RunnerOutcome::Completed, $result->outcome);
+        self::assertSame('reports:generate|2026-09-05T12:00:00+00:00|3', $result->outputTail);
+    }
+
+    #[Test]
+    public function aCommandOutsideTheEngineSeesNoFireVariables(): void
+    {
+        $result = (new ProcessRunner())->run(new TaskSpec('echo "[$SCHEDULER_TICK]"', 10, null, null));
+
+        self::assertSame("[]\n", $result->outputTail);
     }
 
     #[Test]

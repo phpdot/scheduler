@@ -69,7 +69,9 @@ interface SchedulerStoreInterface
      * Atomically claim one fire of a schedule for this server. The whole
      * decision — overlap policy, host concurrency cap, insert-or-adopt — is
      * one storage-level transaction, so across every server ticking only one
-     * claim can win.
+     * claim can win. A run abandoned more times than the store's attempt
+     * ceiling allows is recorded failed instead of adopted, and the fire
+     * passes to a fresh claim.
      *
      * @param ScheduleDefinition $definition The schedule claiming its fire
      * @param string $tick The tick identifier being claimed
@@ -78,7 +80,7 @@ interface SchedulerStoreInterface
      * @param int $leaseTtlSeconds How long the claim lives without a heartbeat
      * @param int $concurrencyLimit Max live runs this host may hold
      *
-     * @return RunRecord|null The claimed run, null when another server holds it.
+     * @return RunRecord|null The claimed run, fresh or adopted; null when the fire is taken, the host is full, or the schedule is gone.
      */
     public function claim(
         ScheduleDefinition $definition,
@@ -137,10 +139,11 @@ interface SchedulerStoreInterface
     public function closeStaleRuns(int $graceSeconds): int;
 
     /**
-     * Delete terminal runs older than the retention window. Running rows are
-     * never deleted — closeStaleRuns() closes them first.
+     * Delete terminal runs that started before the retention window, in
+     * bounded batches. Running rows are never deleted — closeStaleRuns()
+     * closes them first.
      *
-     * @param int $retentionDays Age in days beyond which terminal runs go
+     * @param int $retentionDays Age in days, counted from each run's start, beyond which terminal runs go
      *
      * @return int How many runs were deleted.
      */

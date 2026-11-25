@@ -7,20 +7,24 @@ namespace PHPdot\Scheduler\Tests\Integration\MySql;
 use PHPdot\Database\Connection\MySql\MySqlConfig;
 use PHPdot\Database\DatabaseConnection;
 use PHPdot\Scheduler\Tests\Integration\RelationalStoreTestCase;
+use PHPdot\Scheduler\Tests\Support\RacesARival;
 use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\Test;
 
 #[Group('mysql')]
 #[Group('integration')]
 final class RelationalStoreTest extends RelationalStoreTestCase
 {
+    use RacesARival;
+
     protected function createConnection(): DatabaseConnection
     {
         return new DatabaseConnection(new MySqlConfig(
-            host: getenv('MYSQL_HOST') ?: '127.0.0.1',
-            port: (int) (getenv('MYSQL_PORT') ?: 3306),
-            database: getenv('MYSQL_DB') ?: 'phpdot_test',
-            username: getenv('MYSQL_USER') ?: 'root',
-            password: getenv('MYSQL_PASS') ?: 'root',
+            host: $this->setting('MYSQL_HOST', '127.0.0.1'),
+            port: (int) $this->setting('MYSQL_PORT', '3306'),
+            database: $this->setting('MYSQL_DB', 'phpdot_test'),
+            username: $this->setting('MYSQL_USER', 'root'),
+            password: $this->setting('MYSQL_PASS', 'root'),
         ));
     }
 
@@ -31,5 +35,12 @@ final class RelationalStoreTest extends RelationalStoreTestCase
         }
 
         self::markTestSkipped($reason);
+    }
+
+    #[Test]
+    public function theOverlapGuardHoldsUnderAStricterIsolation(): void
+    {
+        self::assertSame('refused', $this->rivalVerdict('repeatable read', 1));
+        self::assertSame('refused', $this->rivalVerdict('serializable', 2));
     }
 }

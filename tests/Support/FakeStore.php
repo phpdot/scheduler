@@ -40,6 +40,12 @@ final class FakeStore implements SchedulerStoreInterface
 
     public bool $finishThrows = false;
 
+    /** @var list<string> Schedule ids whose claim throws, as a store outage would. */
+    public array $failingSchedules = [];
+
+    /** The attempt a claim hands back: one, unless a test plays an adopted run. */
+    public int $nextAttempt = 1;
+
     public function enabledDefinitions(): array
     {
         return array_values(array_filter($this->definitions, static fn(ScheduleDefinition $definition): bool => $definition->enabled));
@@ -117,6 +123,10 @@ final class FakeStore implements SchedulerStoreInterface
         int $leaseTtlSeconds,
         int $concurrencyLimit,
     ): RunRecord|null {
+        if (in_array($definition->id, $this->failingSchedules, true)) {
+            throw new RuntimeException('Lock wait timeout exceeded');
+        }
+
         $key = $definition->id . '|' . $tick;
 
         if ($this->liveRunsForHost >= $concurrencyLimit) {
@@ -132,7 +142,7 @@ final class FakeStore implements SchedulerStoreInterface
             scheduleId: $definition->id,
             tick: $tick,
             state: RunState::Running,
-            attempt: 1,
+            attempt: $this->nextAttempt,
             claimedBy: $serverId,
             serverHost: $serverHost,
             startedAt: '2026-01-01 00:00:00.000000',

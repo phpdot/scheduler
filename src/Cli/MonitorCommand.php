@@ -4,8 +4,9 @@ declare(strict_types=1);
 
 /**
  * scheduler:monitor — the health check a pager or cron consumes: every
- * enabled schedule must have succeeded within its freshness window, and no
- * run may have failed or died inside the failure window. Exit 1 on breach.
+ * enabled schedule must have covered its latest due fire, no run may have
+ * failed inside the failure window, and no run may sit past its lease. Exit
+ * 1 on breach.
  *
  * @author Omar Hamdan <omar@phpdot.com>
  * @license MIT
@@ -16,10 +17,12 @@ namespace PHPdot\Scheduler\Cli;
 use DateTimeImmutable;
 use DateTimeZone;
 use PHPdot\Console\Command;
+use PHPdot\Scheduler\Contract\RecentFailuresInterface;
 use PHPdot\Scheduler\Contract\SchedulerStoreInterface;
 use PHPdot\Scheduler\Exception\SchedulerException;
 use PHPdot\Scheduler\Run\RunRecord;
 use PHPdot\Scheduler\Run\RunState;
+use PHPdot\Scheduler\Schedule\Pattern;
 use PHPdot\Scheduler\Schedule\PatternKind;
 use PHPdot\Scheduler\Schedule\ScheduleDefinition;
 use Symfony\Component\Console\Attribute\AsCommand;
@@ -53,9 +56,8 @@ final class MonitorCommand extends Command
      */
     protected function configure(): void
     {
-        $this->addOption('failed-within', null, InputOption::VALUE_REQUIRED, 'Minutes back that count failures, 0 disables', '1440');
+        $this->addOption('failed-within', null, InputOption::VALUE_REQUIRED, 'Minutes back in which any failed run alarms, 0 disables', '1440');
         $this->addOption('missed-multiplier', null, InputOption::VALUE_REQUIRED, 'Freshness window as a multiple of the period', '2');
-        $this->addOption('scan', null, InputOption::VALUE_REQUIRED, 'How many recent runs the check reads', '1000');
     }
 
     /**
@@ -64,11 +66,14 @@ final class MonitorCommand extends Command
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $now = new DateTimeImmutable('now');
-        $failureCutoff = $this->textOption($input, 'failed-within') === '0'
-            ? null
-            : $now->modify(sprintf('-%d minutes', max(0, $this->intOption($input, 'failed-within') ?? 1440)));
-        $multiplier = max(1, $this->intOption($input, 'missed-multiplier') ?? 2);
+        $numbers = $this->intOptions($input, $output, ['failed-within' => 1440, 'missed-multiplier' => 2]);
 
+        if ($numbers === null) {
+            return self::FAILURE;
+        }
+
+        $failureWindow = max(0, $numbers['failed-within'] ?? 1440) * 60;
+        $multiplier = max(1, $numbers['missed-multiplier'] ?? 2);
         $failures = 0;
         $rows = [];
         $breaches = 0;
@@ -81,15 +86,13 @@ final class MonitorCommand extends Command
             $latest = $this->store->latestRun($definition->id);
 
             if ($latest !== null && $latest->state === RunState::Running && $this->leaseExpired($latest)) {
-                $rows[] = ['schedule' => $definition->id, 'period' => 'running', 'last success' => '—', 'status' => 'STUCK'];
+                $rows[] = ['schedule' => $definition->id, 'period' => 'running', 'last run' => $this->lastRun($latest), 'status' => 'STUCK'];
                 $breaches++;
 
                 continue;
             }
 
-            if ($latest !== null && $failureCutoff !== null
-                && $this->startedBefore($latest, $now) > $failureCutoff
-                && ($latest->state === RunState::Failed || $latest->state === RunState::Expired)) {
+            if ($failureWindow > 0 && $this->failedRecently($definition->id, $latest, $now, $failureWindow)) {
                 $failures++;
             }
 
@@ -97,73 +100,95 @@ final class MonitorCommand extends Command
                 $period = $this->periodSeconds($definition, $now);
                 $previousDue = $definition->pattern->previousDueTick($now, $definition->timezone);
             } catch (SchedulerException) {
-                $rows[] = ['schedule' => $definition->id, 'period' => 'invalid', 'last success' => '—', 'status' => 'pattern never matches'];
+                $rows[] = ['schedule' => $definition->id, 'period' => 'invalid', 'last run' => $this->lastRun($latest), 'status' => 'pattern never matches'];
                 $breaches++;
 
                 continue;
             }
 
-            $freshness = max(120, $period * $multiplier);
-            $covered = $this->coveredFire($definition, $latest, $previousDue, $now, $freshness);
+            $status = $this->freshness($definition, $latest, $previousDue, $now, max(120, $period * $multiplier));
+
+            if ($status === 'MISSED') {
+                $breaches++;
+            }
 
             $rows[] = [
                 'schedule' => $definition->id,
                 'period' => $period . 's',
-                'last success' => $covered?->format('Y-m-d H:i:s') ?? 'never',
-                'status' => $covered === null ? 'MISSED' : 'ok',
+                'last run' => $this->lastRun($latest),
+                'status' => $status,
             ];
-
-            if ($covered === null) {
-                $breaches++;
-            }
         }
 
         if ($rows !== []) {
             $this->table($output, $rows);
         }
 
-        $this->comment($output, sprintf('monitor — failed/expired in window: %d, freshness breaches: %d', $failures, $breaches > 0 ? $breaches : 0));
+        $this->comment($output, sprintf('monitor — failed/expired in window: %d, freshness breaches: %d', $failures, $breaches));
 
         return ($failures > 0 || $breaches > 0) ? self::FAILURE : self::SUCCESS;
     }
 
     /**
-     * When the schedule's newest run says a fire was covered: a run claims
-     * the latest due tick or a newer one. Deploy-interrupted runs still
-     * count — the fire ran, only its host went away — and a quiet schedule
-     * is judged against its own fires, never a global scan window.
+     * The schedule's freshness verdict. MISSED means a fire it owed went
+     * unrun; pending means it owes nothing yet, having been defined or
+     * resumed after the last instant its pattern matches. A run claims the
+     * latest due tick or a newer one, and deploy-interrupted runs still
+     * count — the fire ran, only its host went away.
      *
-     * @param ScheduleDefinition $definition The schedule being measured
      * @param ScheduleDefinition $definition The schedule being measured
      * @param RunRecord|null $latest Its newest run, null when it never ran
      * @param string $previousDue The latest fire's tick identifier
      * @param DateTimeImmutable $now The instant the judgement is made at
-     * @param int $freshness How stale a run may be, seconds
+     * @param int $tolerance How stale the last run may be, seconds
      *
-     * @return DateTimeImmutable|null When the covering run started, null when missed.
+     * @return string pending, ok, or MISSED.
      */
-    private function coveredFire(
+    private function freshness(
         ScheduleDefinition $definition,
         RunRecord|null $latest,
         string $previousDue,
         DateTimeImmutable $now,
-        int $freshness,
-    ): DateTimeImmutable|null {
-        if ($latest === null) {
-            $age = $now->getTimestamp() - (new DateTimeImmutable($previousDue))->getTimestamp();
-
-            return $age > $definition->graceSeconds ? null : $now;
+        int $tolerance,
+    ): string {
+        if ($definition->expectedSince !== null && $previousDue < $definition->expectedSince->format(Pattern::TICK_FORMAT)) {
+            return 'pending';
         }
 
-        $started = $this->startedBefore($latest, $now);
+        if ($latest === null) {
+            return $now->getTimestamp() - (new DateTimeImmutable($previousDue))->getTimestamp() > $definition->graceSeconds ? 'MISSED' : 'ok';
+        }
 
         if ($latest->tick >= $previousDue) {
-            return $started;
+            return 'ok';
         }
 
-        $stale = $now->getTimestamp() - $started->getTimestamp();
+        return $now->getTimestamp() - $this->startedAt($latest)->getTimestamp() <= $tolerance ? 'ok' : 'MISSED';
+    }
 
-        return $stale <= $freshness ? $started : null;
+    /**
+     * Whether a failed or expired run started inside the window. A store
+     * that can ask its history answers for every run; any other store is
+     * asked only about its newest one.
+     *
+     * @param string $scheduleId The schedule being measured
+     * @param RunRecord|null $latest Its newest run, null when it never ran
+     * @param DateTimeImmutable $now The instant the window ends at
+     * @param int $windowSeconds How far back a failure still counts
+     *
+     * @return bool
+     */
+    private function failedRecently(string $scheduleId, RunRecord|null $latest, DateTimeImmutable $now, int $windowSeconds): bool
+    {
+        if ($this->store instanceof RecentFailuresInterface) {
+            return $this->store->hasRecentFailure($scheduleId, $windowSeconds);
+        }
+
+        if ($latest === null || !in_array($latest->state, [RunState::Failed, RunState::Expired], true)) {
+            return false;
+        }
+
+        return $this->startedAt($latest) >= $now->modify(sprintf('-%d seconds', $windowSeconds));
     }
 
     /**
@@ -180,15 +205,24 @@ final class MonitorCommand extends Command
 
     /**
      * @param RunRecord $run The run whose start is read
-     * @param DateTimeImmutable $now The instant the read is made at
      *
-     * @return DateTimeImmutable When the run started, now when unparsable.
+     * @return DateTimeImmutable When the run started, now when its stamp is unreadable.
      */
-    private function startedBefore(RunRecord $run, DateTimeImmutable $now): DateTimeImmutable
+    private function startedAt(RunRecord $run): DateTimeImmutable
     {
         $started = DateTimeImmutable::createFromFormat(self::STORED_FORMAT, $run->startedAt, new DateTimeZone('UTC'));
 
-        return $started === false ? $now : $started;
+        return $started === false ? new DateTimeImmutable('now') : $started;
+    }
+
+    /**
+     * @param RunRecord|null $latest The schedule's newest run, null when it never ran
+     *
+     * @return string When it started, for the table.
+     */
+    private function lastRun(RunRecord|null $latest): string
+    {
+        return $latest === null ? 'never' : $this->startedAt($latest)->format('Y-m-d H:i:s');
     }
 
     /**

@@ -66,7 +66,7 @@ final class Scheduler
                 break;
             }
 
-            $outcomes[] = $this->evaluate($definition, $at);
+            $outcomes[] = $this->evaluateOrReport($definition, $at);
         }
 
         return new TickReport($at, $outcomes);
@@ -101,6 +101,27 @@ final class Scheduler
     {
         $this->aborted = true;
         $this->runner->stopAll();
+    }
+
+    /**
+     * Evaluate one schedule with its own failures kept to it: a store that
+     * throws for this schedule costs this schedule the pass, never the ones
+     * ordered after it.
+     *
+     * @param ScheduleDefinition $definition The schedule being evaluated
+     * @param DateTimeImmutable $at The instant to evaluate against
+     *
+     * @return TickOutcome The schedule's fate this pass.
+     */
+    private function evaluateOrReport(ScheduleDefinition $definition, DateTimeImmutable $at): TickOutcome
+    {
+        try {
+            return $this->evaluate($definition, $at);
+        } catch (Throwable $failure) {
+            error_log(sprintf('[scheduler] schedule %s skipped this pass, its store call failed: %s', $definition->id, $failure->getMessage()));
+
+            return new TickOutcome($definition->id, null, TickResult::StoreError, null, $failure->getMessage());
+        }
     }
 
     /**
@@ -170,6 +191,9 @@ final class Scheduler
             $definition->idleTimeoutSeconds,
             $this->config->commandCwd,
             $this->config->env,
+            $definition->id,
+            $run->tick,
+            $run->attempt,
         );
 
         $lastBeat = microtime(true) - $this->config->heartbeatSeconds;
@@ -187,7 +211,7 @@ final class Scheduler
             RunnerOutcome::Failed, RunnerOutcome::TimedOut, RunnerOutcome::Interrupted => RunState::Failed,
         };
 
-        $recorded = $this->finishClaimed($run, new RunOutcome(
+        $unrecorded = $this->finishClaimed($run, new RunOutcome(
             $state,
             $result->exitCode,
             $result->durationMs,
@@ -195,8 +219,8 @@ final class Scheduler
             $result->error,
         ));
 
-        if (!$recorded) {
-            return new TickOutcome($definition->id, $run->tick, TickResult::Fenced, $result->durationMs, 'a newer attempt owns the run');
+        if ($unrecorded !== null) {
+            return new TickOutcome($definition->id, $run->tick, TickResult::Fenced, $result->durationMs, $unrecorded);
         }
 
         $resultCase = match ($result->outcome) {
@@ -286,18 +310,18 @@ final class Scheduler
      * Record the outcome, guarding the final write: a failed write must never
      * leave a finished run claimable again. The row is re-read after a failed
      * write; a newer attempt already owning it is fenced, anything else is
-     * logged for a human, and the caller hears the run was not recorded —
-     * the store's claim record, not the execution, decides adoption.
+     * logged for a human, and the caller hears why its outcome is not the
+     * record — the store's claim record, not the execution, decides adoption.
      *
      * @param RunRecord $run The claim this server held
      * @param RunOutcome $outcome What the execution did
      *
-     * @return bool True when this server's outcome was recorded.
+     * @return string|null Null once recorded, else why this server's outcome is not the record.
      */
-    private function finishClaimed(RunRecord $run, RunOutcome $outcome): bool
+    private function finishClaimed(RunRecord $run, RunOutcome $outcome): string|null
     {
         try {
-            return $this->store->finish($run, $outcome);
+            return $this->store->finish($run, $outcome) ? null : 'a newer attempt owns the run';
         } catch (Throwable $failure) {
             error_log(sprintf('[scheduler] run %d finish write failed: %s', $run->id, $failure->getMessage()));
         }
@@ -306,7 +330,7 @@ final class Scheduler
             $current = $this->store->runByTick($run->scheduleId, $run->tick);
 
             if ($current !== null && $current->attempt > $run->attempt) {
-                return false;
+                return 'a newer attempt owns the run';
             }
         } catch (Throwable) {
         }
@@ -318,6 +342,6 @@ final class Scheduler
             $run->tick,
         ));
 
-        return false;
+        return 'the outcome could not be recorded; the run will be adopted and run again';
     }
 }
